@@ -6,6 +6,7 @@ Dla każdego scenariusza: losowanie parametrów z podanych zakresów i zapis do 
 from __future__ import annotations
 
 import math
+import os
 import random
 from typing import Any
 
@@ -62,15 +63,26 @@ K_WIND_N_PER_MS = _WIND_LEGACY_K_N_PER_MS * (_WIND_LEGACY_PARAM_MS / _WIND_LEGAC
 DEFAULT_WIND_PHYSICS_PARAMS: dict[str, Any] = {
     "wind_force_model": "legacy",  # "legacy" | "drag"
     "wind_dynamic_enabled": True,
-    # OU: umiarkowana zmienność (bez „szalonego” skoku); większe tau = wolniejszy dryf kierunku
+    # OU (turbulencja): losowe odchylenia składowych wiatru w płaszczyźnie NED **N (North) i E (East)** —
+    # wektor wiatru poziomo „pływa” w czasie wokół średniej (to jest ten „dryf” składowych n/e, nie przesuwanie całej pogody).
+    # Większe tau → wolniejsza zmiana tych składowych; sigma → rząd wielkości odchyłek [m/s].
     "wind_tau_s": 0.55,
-    "wind_sigma_ms": 0.28,
+    "wind_sigma_ms": 0.35,
     "wind_gust_prob_per_s": 0.018,
-    "wind_gust_T_min_s": 2.0,
+    # Całkowity czas podmuchu T = t_narastania + t_opadania; clamp do [T_min, T_max] (przy domyślnych rise/fall min 1,6 s).
+    "wind_gust_T_min_s": 1.6,
     "wind_gust_T_max_s": 15.0,
-    # Amplituda podmuchu wzdłuż średniego — zmniejszona vs 2.0, żeby nie skakało o kilka m/s naraz
-    "wind_gust_A_rel_ms": 1.15,
-    # Losowy moment szczytu podmuchu: peak_frac * T, peak_frac ∈ [min, max] (losowe Poisson).
+    # Podmuch 1−cos: dodatek wzdłuż średniego wiatru w szczycie — losowo U(A_min, A_max) [m/s].
+    "wind_gust_A_rel_min_ms": 1.5,
+    "wind_gust_A_rel_max_ms": 3.0,
+    # Zachowanie wsteczne: gdy w JSON jest tylko ten klucz (bez min/max), generator i tak bierze min=max z A_rel_ms.
+    "wind_gust_A_rel_ms": 2.25,
+    # Czas narastania do szczytu i czas opadania (s symulacji); ustawione oba → losowe podmuchy **nie** używają peak_frac×T.
+    "wind_gust_rise_time_min_s": 0.8,
+    "wind_gust_rise_time_max_s": 2.0,
+    "wind_gust_fall_time_min_s": 0.8,
+    "wind_gust_fall_time_max_s": 2.0,
+    # Legacy (gdy **usuniesz** z params oba klucze wind_gust_rise_time_*): peak_frac * T, peak_frac ∈ [min, max].
     "wind_gust_peak_frac_min": 0.1,
     "wind_gust_peak_frac_max": 0.9,
     "wind_gust_lull_enabled": True,
@@ -104,7 +116,7 @@ SCENARIO_1_FIXED = {
     # Turbulencja OU: większe tau / mniejsze sigma → wolniejsza zmiana kierunku „z którego wieje” na panelu (nadal chwilowy wektor).
     # Przy bardzo słabej średniej (np. 1 m/s) i dużym sigma domyślne składowa wzdłużna często wpada w obcięcie (along≥0) → skoki kierunku ~90°.
     "wind_tau_s": 1.4,
-    "wind_sigma_ms": 0.26,
+    "wind_sigma_ms": 0.35,
     # Harmonogram: opcjonalnie "peak_fraction" (0–1) = część duration do szczytu; brak → szczyt w połowie (symetrycznie).
     "wind_gust_schedule": [
         {"t_start_s": 11.67, "duration_s": 9.5, "A_rel_ms": 3, "peak_fraction": 0.35},
@@ -151,6 +163,12 @@ def get_scenario_1_fixed_params(wind_enabled: bool) -> dict:
             "wind_gust_T_min_s",
             "wind_gust_T_max_s",
             "wind_gust_A_rel_ms",
+            "wind_gust_A_rel_min_ms",
+            "wind_gust_A_rel_max_ms",
+            "wind_gust_rise_time_min_s",
+            "wind_gust_rise_time_max_s",
+            "wind_gust_fall_time_min_s",
+            "wind_gust_fall_time_max_s",
             "wind_gust_peak_frac_min",
             "wind_gust_peak_frac_max",
             "wind_gust_lull_enabled",
@@ -179,9 +197,9 @@ def _draw_wind_speed_scenario_1() -> float:
 
 def draw_scenario_1() -> dict:
     """Scenariusz 1: lot prosto na losowy dystans 500–1000 m, lekka modulacja wysokości (sinus ±5 %), wiatr jak wyżej."""
-    v_cmd = _r(5.0, 25.0)
+    v_cmd = _r(4.0, 30.0)
     distance_m = _r(500.0, 1000.0)
-    altitude_m = _r(10.0, 50.0)
+    altitude_m = _r(10.0, 20.0)
     t_end = distance_m / v_cmd if v_cmd > 0 else 60.0
     # Kilka pełnych „fal” wysokości w czasie szacowanego lotu poziomego
     period_s = max(18.0, min(100.0, t_end / 2.2))
@@ -220,36 +238,30 @@ def _stub_scenario(scenario_id: int, name: str, snippet: str) -> dict:
 
 def draw_scenario_2() -> dict:
     """
-    Scenariusz 2: bliźniak scenariusza 1 — ten sam lot (v, yaw, dystans, wysokość, wiatr),
-    ale z fazą podejścia do wylosowanego punktu docelowego i zakończeniem przez PX4 AUTO LAND.
-    Punkt celu: spawn (0,0) + distance_m w azymucie yaw (płaszczyzna XY).
+    Scenariusz 2: jak scenariusz 1 (v, yaw, dystans poziomy od spawnu, wysokość ±5 %, wiatr),
+    potem przy osiągnięciu distance_m — hamowanie do ~0 prędkości poziomej, potem PX4 AUTO LAND + NAV_LAND w miejscu.
+    Punkt referencyjny XY: spawn + distance_m w azymucie yaw (target_xy / etykiety).
     """
-    v_cmd = _r(5.0, 25.0)
+    v_cmd = _r(4.0, 30.0)
     distance_m = _r(500.0, 1000.0)
-    altitude_m = _r(10.0, 50.0)
+    altitude_m = _r(10.0, 20.0)
     yaw_deg = _r(0.0, 360.0)
     t_cruise = distance_m / v_cmd if v_cmd > 0 else 60.0
     period_s = max(18.0, min(100.0, t_cruise / 2.2))
-    # Szacunek faz misji (etykiety; faktyczny czas zależy od PX4 / wiatru)
-    t_align_s = 55.0
-    t_descend_s = 90.0
+    # Szacunek faz (etykiety; faktyczny czas = PX4 / wiatr)
+    t_brake_s = 45.0
     t_land_s = 120.0
     phase_times = [
         {"phase": "lot_prosty", "t_start_s": 0.0, "t_end_s": round(t_cruise, 2)},
         {
-            "phase": "wyrownanie_xy",
+            "phase": "hamowanie",
             "t_start_s": round(t_cruise, 2),
-            "t_end_s": round(t_cruise + t_align_s, 2),
+            "t_end_s": round(t_cruise + t_brake_s, 2),
         },
         {
-            "phase": "schodzenie_pionowe",
-            "t_start_s": round(t_cruise + t_align_s, 2),
-            "t_end_s": round(t_cruise + t_align_s + t_descend_s, 2),
-        },
-        {
-            "phase": "ladowanie",
-            "t_start_s": round(t_cruise + t_align_s + t_descend_s, 2),
-            "t_end_s": round(t_cruise + t_align_s + t_descend_s + t_land_s, 2),
+            "phase": "ladowanie_px4",
+            "t_start_s": round(t_cruise + t_brake_s, 2),
+            "t_end_s": round(t_cruise + t_brake_s + t_land_s, 2),
         },
     ]
     yrad = math.radians(yaw_deg)
@@ -262,24 +274,40 @@ def draw_scenario_2() -> dict:
         "wind_speed_ms": _draw_wind_speed_scenario_1(),
         "wind_dir_deg": _r(0.0, 360.0),
         "distance_m": distance_m,
-        "altitude_variation_frac": 0.05,
+        # Scen. 2: w locie wysokość = PD względem altitude_m (patrz run_stachometr), nie sinus vz jak w scen. 1.
+        "altitude_variation_frac": 0.0,
         "altitude_variation_period_s": round(period_s, 2),
+        "land_cruise_z_hold_kp": 1.35,
+        "land_cruise_z_hold_kd": 0.7,
+        "land_cruise_z_vz_cap_ms": 3.5,
+        "land_cruise_z_wobble_frac": 0.012,
+        "land_cruise_z_kp_boost": 1.9,
+        "land_cruise_acquire_boost_s": 14.0,
         # Cel w płaszczyźnie XY względem spawnu (0,0) — zgodnie z run_stachometr (spawn_xy)
         "target_xy_offset_m": [round(distance_m * math.cos(yrad), 3), round(distance_m * math.sin(yrad), 3)],
-        "land_approach_start_m": 35.0,
-        "land_approach_v_max_ms": 4.0,
-        "land_xy_align_m": 4.0,
+        # Hamowanie po distance_m: |v_xy|→0 + hold wys. (z↑); potem PX4 AUTO LAND + MAV_CMD_NAV_LAND (bez długiego offboard zejścia).
+        # Hamowanie: OFFBOARD vx=vy=0 + hold wys.; przejście do lądowania gdy |v_xy| ≤ stop przez settle_s (lub timeout).
+        # Skrócone hamowanie: nie ma wisieć długo w powietrzu.
+        # Uwaga: runtime używa też kryterium timeout; poniższe wartości są domyślne.
+        "land_brake_v_stop_ms": 0.35,
+        "land_brake_settle_s": 0.5,
+        "land_brake_timeout_s": 5.0,
+        # Hamowanie: ta sama konwencja z↑ co Pegasus (nie „NED z” z pozycji).
+        "land_brake_z_hold_kp": 1.45,
+        "land_brake_z_hold_kd": 0.65,
+        "land_brake_z_vz_cap_ms": 2.2,
         "land_descend_vz_ms": 0.85,
         "land_auto_land_alt_z_m": 3.0,
-        "land_descend_xy_drift_max_m": 7.0,
-        "land_align_timeout_s": 95.0,
         "land_phase_timeout_s": 180.0,
         "landed_pos_z_max_m": 0.4,
         "landed_total_speed_max_ms": 0.6,
+        # Po stabilnym touchdown: czekaj → DISARM → czekaj → koniec run (symulacja).
+        "land_after_touchdown_s": 2.0,
+        "land_after_disarm_s": 2.0,
         "phase_times": phase_times,
         "phase_times_description": (
-            "lot_prosty (±5 % wys.) → wyrownanie_xy nad punktem → schodzenie_pionowe (vz w dół NED) → "
-            "ladowanie (AUTO LAND gdy z ≤ land_auto_land_alt_z_m). Czas faz w phase_times: szacunek."
+            "cruise: PD w z↑ Pegasus + małe wahanie celu (wobble_frac); "
+            "hamowanie: snapshot wysokości, |v_xy|→0; potem PX4 AUTO LAND + NAV_LAND w miejscu. phase_times: szacunek."
         ),
         "wind_dynamic_enabled": True,
     }
@@ -341,12 +369,23 @@ DRAW_FUNCTIONS = {
 
 
 def draw_scenario(scenario_id: int, seed: int | None = None) -> dict:
-    """Losuje parametry dla danego scenariusza. Opcjonalnie seed dla powtarzalności."""
-    if seed is not None:
-        random.seed(seed)
+    """Losuje parametry dla danego scenariusza. Opcjonalnie seed dla powtarzalności.
+
+    Przy ``seed is None`` ustawiamy entropię z ``os.urandom`` i **przywracamy** stan globalnego
+    ``random`` po losowaniu — inaczej Isaac/Omniverse mógł wcześniej ustawić stały seed i każdy
+    run bez ``--seed`` dawałby te same parametry (np. zawsze to samo ``v_cmd_ms``).
+    """
     if scenario_id not in DRAW_FUNCTIONS:
         raise ValueError(f"Nieznany scenario_id={scenario_id}. Dostępne: 1..10")
-    return merge_wind_defaults(DRAW_FUNCTIONS[scenario_id]())
+    rng_state = random.getstate()
+    try:
+        if seed is not None:
+            random.seed(seed)
+        else:
+            random.seed(int.from_bytes(os.urandom(8), "little"))
+        return merge_wind_defaults(DRAW_FUNCTIONS[scenario_id]())
+    finally:
+        random.setstate(rng_state)
 
 
 def get_scenario_description(scenario_id: int) -> str:

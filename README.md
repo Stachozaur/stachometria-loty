@@ -96,6 +96,7 @@ Zgodnie z **docs/py/scenarios.md** (sekcja „Etykiety faz z definicji scenarius
   4. Potem **główna pętla** z logowaniem stanu do CSV.
 
 - Jeśli wysłanie na 14580 się nie uda (np. inna konfiguracja PX4), w trybie **preview** możesz uzbroić i wykonać takeoff ręcznie z QGroundControl (QGC na 14550).
+- **Duża „kratka” / podłoże na długie loty (np. scen. 2 ~1 km):** domyślnie po załadowaniu `Flat Plane` skrypt przeskalowuje największą płaską powierzchnię pod `/World` do **~2000 m** boku (`--ground-extent-m 2000`). Wyłączenie: `--ground-extent-m 0`. Inny rozmiar: np. `--ground-extent-m 3000`.
 
 ## Uwagi
 

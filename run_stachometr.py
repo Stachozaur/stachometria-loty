@@ -23,6 +23,8 @@ Użycie:
 
   Scenariusz 2 (lot do celu 500–1000 m + lądowanie PX4 AUTO LAND), z wiatrem:
     ./python.sh stachometr/run_stachometr.py --preview --scenario 2 --seed $RANDOM
+  Większe podłoże / „kratka” w viewport (~2 km bok, domyślnie włączone):
+    # opcjonalnie: --ground-extent-m 0 wyłącza; --ground-extent-m 3000 → 3 km
 
   Dla wszystkich scenariuszy po 50 lotów (batch):
     for s in $(seq 1 10); do ./python.sh stachometr/run_stachometr.py --headless --scenario $s --runs 50; done
@@ -36,6 +38,7 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 # Dodaj ścieżkę do stachometr (import scenario_params)
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -59,6 +62,12 @@ def _parse_args_before_isaac():
     parser.add_argument("--output-dir", type=str, default=None, help="Katalog na JSON+CSV (domyślnie: stachometr_output)")
     parser.add_argument("--seed", type=int, default=None, help="Seed dla powtarzalności (opcjonalnie)")
     parser.add_argument("--duration-s", type=float, default=120.0, help="Czas jednego runu w sekundach (symulacja)")
+    parser.add_argument(
+        "--ground-extent-m",
+        type=float,
+        default=2000.0,
+        help="Docelowy bok płaskiego podłoża (m) po przeskalowaniu — większa „kratka”/ziemia na długie loty; 0=wyłącz",
+    )
     return parser.parse_known_args()[0]
 
 _ARGS_EARLY = _parse_args_before_isaac()
@@ -76,7 +85,7 @@ import omni.physx
 import omni.timeline
 import omni.usd
 from omni.isaac.core.world import World
-from pxr import Gf, PhysicsSchemaTools
+from pxr import Gf, PhysicsSchemaTools, Usd, UsdGeom, UsdPhysics
 from scipy.spatial.transform import Rotation
 
 from pegasus.simulator.params import ROBOTS, SIMULATION_ENVIRONMENTS
@@ -517,6 +526,10 @@ def _save_params_json(params: dict, scenario_id: int, run_id: int, output_dir: P
         "phase_labels_description": PHASE_LABELS_DOC,
         "mission_start_offset_s": MISSION_START_OFFSET_S,
         "phase_times": full_phase_times,
+        "phase_times_disclaimer": (
+            "PRE-FLIGHT ESTIMATE ONLY: built from scenario formulas (distance/v_cmd, etc.), not measured during the run. "
+            "Real transition times are in the companion file *_flight_timeline.json (English marks, t_sim_s = CSV time_s)."
+        ),
         "phase_times_note": (
             "Czas 0–{:.0f} s: rozgrzewka (PX4/EKF). {:.0f}–{:.0f} s: wznoszenie. Od {:.0f} s: prawdziwa misja (fazy scenariusza)."
             .format(WARMUP_S, WARMUP_S, MISSION_START_OFFSET_S, MISSION_START_OFFSET_S)
@@ -599,6 +612,251 @@ def _log_state_csv_path(
     return output_dir / f"{base}_state.csv"
 
 
+class _FlightTimeline:
+    """Rejestracja znaczników lotu.
+
+    `t_sim_s` musi być spójne z tym co trafia do CSV (`time_s`), żeby porównania dystans/czas miały sens.
+    Gdy podamy `time_getter`, używamy prawdziwego czasu symulacji z Isaaca (world.current_time), a nie
+    prostej zależności `step*physics_dt` (która bywa niezgodna, jeśli jedno `world.step()` wykonuje więcej
+    pod-kroków fizyki).
+    """
+
+    def __init__(self, physics_dt: float, time_getter=None):
+        self.physics_dt = float(physics_dt)
+        self._time_getter = time_getter
+        self._t0_wall = time.perf_counter()
+        self.marks: list[dict[str, Any]] = []
+        self._once: set[str] = set()
+
+    def t_sim(self, step: int) -> float:
+        if self._time_getter is not None:
+            return float(self._time_getter())
+        return float(step) * self.physics_dt
+
+    def mark(self, name: str, step: int, **extra: Any) -> None:
+        entry: dict[str, Any] = {
+            "mark": name,
+            "t_sim_s": round(self.t_sim(step), 4),
+            "wall_elapsed_s": round(time.perf_counter() - self._t0_wall, 4),
+        }
+        for k, v in extra.items():
+            if v is None:
+                continue
+            if isinstance(v, float):
+                entry[k] = round(v, 5)
+            elif isinstance(v, (bool, str, int)):
+                entry[k] = v
+            else:
+                entry[k] = v
+        self.marks.append(entry)
+
+    def mark_once(self, name: str, step: int, **extra: Any) -> None:
+        if name in self._once:
+            return
+        self._once.add(name)
+        self.mark(name, step, **extra)
+
+
+def _save_flight_timeline_json(
+    timeline: _FlightTimeline,
+    csv_path: Path,
+    scenario_id: int,
+    run_id: int,
+    run_start_time: str,
+    meta: dict[str, Any],
+) -> Path | None:
+    """Zapis ``*_flight_timeline.json`` obok CSV (to samo ``run_s*`` + ``_flight_timeline``)."""
+    if not timeline.marks:
+        return None
+    stem = csv_path.stem
+    if stem.endswith("_state"):
+        stem = stem[: -len("_state")]
+    fname = f"{stem}_flight_timeline.json"
+    fpath = csv_path.with_name(fname)
+    out = {
+        "schema": "stachometr_flight_timeline_v1",
+        "run_start_time": run_start_time,
+        "scenario_id": scenario_id,
+        "run_id": run_id,
+        "physics_dt_s": timeline.physics_dt,
+        "time_base": "t_sim_s matches CSV column time_s (from world.current_time base)",
+        "wall_clock_note": "wall_elapsed_s = seconds since timeline object creation (start of CSV logging loop)",
+        "marks": timeline.marks,
+        **meta,
+    }
+    try:
+        with open(fpath, "w", encoding="utf-8") as f:
+            json.dump(out, f, ensure_ascii=False, indent=2, default=_json_serializable)
+        carb.log_info(f"Stachometr: zapisano oś czasu lotu: {fpath}")
+    except Exception as e:
+        carb.log_warn(f"Stachometr: zapis flight_timeline: {e}")
+        return None
+    return fpath
+
+
+def _pick_xform_scale_target(mesh_or_gprim: Usd.Prim) -> Usd.Prim:
+    """Pierwszy przodek Xform pod /World, inaczej sam prim."""
+    p = mesh_or_gprim.GetParent()
+    while p and p.IsValid():
+        ps = str(p.GetPath())
+        if ps == "/World":
+            break
+        if p.IsA(UsdGeom.Xform):
+            return p
+        p = p.GetParent()
+    return mesh_or_gprim
+
+
+def _apply_uniform_xy_scale_on_prim(scale_prim: Usd.Prim, factor_xy: float) -> bool:
+    """Mnoży istniejący Scale Xform o (factor_xy, factor_xy, 1) lub dodaje Scale op."""
+    if factor_xy <= 1.001:
+        return False
+    xf = UsdGeom.Xformable(scale_prim)
+    for op in xf.GetOrderedXformOps():
+        if op.GetOpType() == UsdGeom.XformOp.TypeScale:
+            try:
+                v = op.Get()
+                op.Set(
+                    Gf.Vec3d(float(v[0]) * factor_xy, float(v[1]) * factor_xy, float(v[2]))
+                )
+                return True
+            except Exception:
+                break
+    xf.AddScaleOp(precision=UsdGeom.XformOp.PrecisionDouble).Set(
+        Gf.Vec3d(factor_xy, factor_xy, 1.0)
+    )
+    return True
+
+
+def _scale_flat_ground_extent_xy(stage, extent_xy_m: float) -> None:
+    """
+    Powiększa **wszystkie** duże płaskie fragmenty podłoża (Flat Plane bywa złożony z kilku meshów
+    ~500×500 m — wcześniej skalowaliśmy tylko jeden). Skaluje osobno każdy pasujący Gprim (jego Xform).
+    """
+    if extent_xy_m < 100.0:
+        return
+    try:
+        world = stage.GetPrimAtPath("/World")
+        if not world or not world.IsValid():
+            return
+        skip_sub = ("quadrotor", "iris", "camera", "light", "dome", "px4", "sun", "shadow")
+        try:
+            purposes = [
+                UsdGeom.Tokens.default_,
+                UsdGeom.Tokens.render,
+                UsdGeom.Tokens.proxy,
+            ]
+        except Exception:
+            purposes = ["default", "render", "proxy"]
+        for _tok in ("physics", "guide"):
+            try:
+                purposes.append(getattr(UsdGeom.Tokens, _tok))
+            except Exception:
+                if _tok == "physics":
+                    purposes.append("physics")
+                elif _tok == "guide":
+                    purposes.append("guide")
+        cache = UsdGeom.BBoxCache(Usd.TimeCode.Default(), includedPurposes=purposes, useExtentsHint=True)
+        candidates: list[tuple[Usd.Prim, float, float, float]] = []
+        for prim in Usd.PrimRange(world):
+            pstr = str(prim.GetPath()).lower()
+            if any(s in pstr for s in skip_sub):
+                continue
+            if not prim.IsActive():
+                continue
+            if not prim.IsA(UsdGeom.Gprim):
+                continue
+            try:
+                wb = cache.ComputeWorldBound(prim)
+                rng = wb.ComputeAlignedRange()
+            except Exception:
+                continue
+            mn, mx = rng.GetMin(), rng.GetMax()
+            sx = float(mx[0] - mn[0])
+            sy = float(mx[1] - mn[1])
+            sz = float(mx[2] - mn[2])
+            # Płaskie „płyty”; nieco luźniejsze progi (kolizja / kilka meshów)
+            if sz > 45.0 or sx < 12.0 or sy < 12.0:
+                continue
+            if sx * sy < 2000.0:
+                continue
+            candidates.append((prim, sx, sy, sz))
+        if not candidates:
+            carb.log_warn(
+                "Stachometr: nie znaleziono płaskiego podłoża pod /World — pomijam --ground-extent-m."
+            )
+            return
+        scaled_xforms: set[str] = set()
+        n_done = 0
+        for prim, sx, sy, _sz in candidates:
+            cur = max(sx, sy)
+            if cur < 1.0:
+                continue
+            factor = float(extent_xy_m) / cur
+            if factor <= 1.01:
+                continue
+            target = _pick_xform_scale_target(prim)
+            tpath = str(target.GetPath())
+            if tpath in scaled_xforms:
+                continue
+            if _apply_uniform_xy_scale_on_prim(target, factor):
+                scaled_xforms.add(tpath)
+                n_done += 1
+                carb.log_info(
+                    f"Stachometr: podłoże ×{factor:.3f} (≈{cur:.0f}→{extent_xy_m:.0f} m XY) "
+                    f"`{tpath}` (z mesha `{prim.GetPath()}`)."
+                )
+        if n_done == 0:
+            carb.log_info(
+                f"Stachometr: wszystkie wykryte płyty już ≥ {extent_xy_m:.0f} m — bez skalowania."
+            )
+    except Exception as e:
+        carb.log_warn(f"Stachometr: skalowanie podłoża (--ground-extent-m): {e}")
+
+
+def _add_stachometr_ground_collision_cube(stage: Usd.Stage, extent_xy_m: float) -> None:
+    """
+    Duży sześcian z samą kolizją (niewidoczny): górna powierzchnia przy z≈0.
+    Zabezpiecza lądowanie / fizykę, gdy skalowanie istniejącego mesha nic nie złapie lub bbox był wcześniej pusty.
+    """
+    if extent_xy_m < 100.0:
+        return
+    try:
+        path = "/World/StachometrGroundCollision"
+        prim = stage.GetPrimAtPath(path)
+        if prim.IsValid():
+            stage.RemovePrim(path)
+        side = float(extent_xy_m)
+        cz = -0.5 * side  # środek: wierzch sześcianu przy z=0 (Pegasus z↑)
+        cube = UsdGeom.Cube.Define(stage, path)
+        cube.CreateSizeAttr(side)
+        xf = UsdGeom.Xformable(cube.GetPrim())
+        xf.ClearXformOpOrder()
+        xf.AddTranslateOp(precision=UsdGeom.XformOp.PrecisionDouble).Set(Gf.Vec3d(0.0, 0.0, cz))
+        UsdPhysics.CollisionAPI.Apply(cube.GetPrim())
+        try:
+            UsdGeom.Imageable(cube.GetPrim()).MakeInvisible()
+        except Exception:
+            pass
+        carb.log_info(
+            f"Stachometr: niewidzialna płyta kolizji ~{side:.0f}×{side:.0f} m (góra z≈0) `{path}` "
+            "(fizyka nawet bez skalowania widocznego terenu)."
+        )
+    except Exception as e:
+        carb.log_warn(f"Stachometr: nie udało się dodać płyty kolizji (--ground-extent-m): {e}")
+
+
+def _apply_ground_extent_after_world_reset(ground_extent_xy_m: float) -> None:
+    """Wywołaj po `world.reset()`: bbox podłoża jest wtedy wiarygodny; skalowanie + backup kolizji."""
+    if ground_extent_xy_m < 100.0:
+        return
+    st = omni.usd.get_context().get_stage()
+    if st is None:
+        return
+    _scale_flat_ground_extent_xy(st, ground_extent_xy_m)
+    _add_stachometr_ground_collision_cube(st, ground_extent_xy_m)
+
+
 def _add_bright_lighting() -> None:
     """Dodaje umiarkowane oświetlenie — scena czytelna (szarości), dron ciemny na jaśniejszym tle (kontrast)."""
     try:
@@ -645,6 +903,7 @@ def run_single(
     wind_suffix: str | None = None,
     show_live_display: bool = False,
     random_seed: int | None = None,
+    ground_extent_xy_m: float = 0.0,
 ) -> None:
     """Wykonuje jeden run: świat + IRIS + PX4, logowanie stanu do CSV. wind_suffix: np. 'nowind'/'wind' dla scenariusza 1."""
     run_params = merge_wind_defaults(dict(params))
@@ -663,6 +922,7 @@ def run_single(
 
     # Nieskończona płaska powierzchnia (terrain), żeby dron mógł lecieć 200 m+ bez ścian.
     pg.load_environment(SIMULATION_ENVIRONMENTS["Flat Plane"])
+    # Skalowanie podłoża — dopiero po world.reset() (patrz niżej); tu bbox bywa jeszcze pusty.
     _add_bright_lighting()
 
     # Konfiguracja IRIS + PX4 (jak w 1_px4_single_vehicle.py)
@@ -694,6 +954,8 @@ def run_single(
     )
 
     world.reset()
+
+    _apply_ground_extent_after_world_reset(ground_extent_xy_m)
 
     csv_path = _log_state_csv_path(output_dir, scenario_id, run_id, run_start_time, wind_suffix=wind_suffix)
 
@@ -758,8 +1020,8 @@ def run_single(
     # Pegasus: świeży GT (pozycja, CSV, panel) jest na tym obiekcie. Kolejne pg.get_vehicle() zwraca czasem
     # uchwyt bez aktualnego state — wtedy dystans misji wychodził ~0 i cel 200 m nie kończył runu przy ~900 m na panelu.
     spawn_goal_reached = False
-    # Krok czasu **fizyki** musi pochodzić ze świata Isaac (PhysX). Błąd: założenie 1/250 przy domyślnym 1/60
-    # skraca `time_s` w CSV ~4× względem prawdziwego postępu (dystans/prędkość przestają się zgadzać z time_s).
+    # `time_s` w CSV bierzemy z `world.current_time` (prawdziwy czas symulacji fizycznej),
+    # żeby metry/dystans zgadzały się z liczbami z prędkości (bez rozjazdu typu ~4×).
     physics_dt = 1.0 / 60.0
     try:
         physics_dt = float(world.get_physics_dt())
@@ -770,6 +1032,10 @@ def run_single(
         carb.log_warn(f"Stachometr: nieprawidłowy physics_dt, używam {physics_dt}")
     carb.log_info(f"Stachometr: physics_dt={physics_dt:.6f} s/krok (~{1.0/physics_dt:.1f} Hz) — time_s, wiatr, MAVLink")
     _steps_per_sim_second = max(1, int(round(1.0 / physics_dt)))
+
+    csv_sim_time_base_s = float(getattr(world, "current_time", 0.0) or 0.0)
+    flight_timeline = _FlightTimeline(physics_dt, time_getter=lambda: float(world.current_time) - csv_sim_time_base_s)
+    flight_timeline.mark("simulation_csv_logging_started", 0)
 
     # Wiatr: generator prędkości (stały / dynamiczny) + model siły legacy albo drag; apply_force_at_pos w NED.
     _wind_stage_id = None
@@ -1024,7 +1290,7 @@ def run_single(
         return out
 
     def log_state(step_count: int) -> None:
-        t = step_count * physics_dt
+        t = float(world.current_time) - csv_sim_time_base_s
         flown_m = None
         if live_display and mission_ctx["start_xy"] is not None and vehicle is not None and getattr(vehicle, "state", None) is not None:
             p = vehicle.state.position
@@ -1083,6 +1349,7 @@ def run_single(
         step += 1
         if spawn_goal_reached:
             break
+    flight_timeline.mark_once("warmup_complete_px4_ekf_window", step)
 
     # 2) Tryb Takeoff + ARM (port 14580 Onboard PX4)
     # PX4: najpierw SET_MODE Takeoff (AUTO_TAKEOFF), potem ARM — wtedy po uzbrojeniu dron sam wznosi (do MIS_TAKEOFF_ALT).
@@ -1093,6 +1360,7 @@ def run_single(
             mav_out = MavlinkOffboard("udpout:127.0.0.1:14580")
             if mav_out.bind():
                 mav_out.set_mode_takeoff_px4()
+                flight_timeline.mark_once("px4_auto_takeoff_mode_command_sent", step)
                 for _ in range(int(0.5 / physics_dt)):
                     if not simulation_app.is_running():
                         break
@@ -1104,6 +1372,7 @@ def run_single(
                         break
                 if not spawn_goal_reached:
                     mav_out.arm()
+                    flight_timeline.mark_once("px4_arm_command_sent", step)
                 mav_out.close()
                 if not spawn_goal_reached:
                     carb.log_info("Wysłano SET_MODE Takeoff + ARM (port 14580); wznoszenie do MIS_TAKEOFF_ALT")
@@ -1116,6 +1385,7 @@ def run_single(
     # 3) Wznoszenie (etykieta: wznoszenie) — logowanie
     if not spawn_goal_reached:
         takeoff_steps = int(TAKEOFF_WAIT_S / physics_dt)
+        takeoff_end_reason = "takeoff_wait_full_duration"
         for _ in range(takeoff_steps):
             if not simulation_app.is_running():
                 break
@@ -1127,7 +1397,14 @@ def run_single(
                 break
             if vehicle is not None and vehicle._state is not None:
                 if vehicle.state.position[2] >= alt_target - 1.5:
+                    takeoff_end_reason = "altitude_near_target_gate"
                     break
+        flight_timeline.mark_once(
+            "takeoff_climb_phase_end",
+            step,
+            reason=takeoff_end_reason,
+            altitude_target_m=round(float(alt_target), 3),
+        )
 
     # 4) Prawdziwa misja — fazy scenariusza (logowanie)
     if not spawn_goal_reached and scenario_id == 1 and HAS_MAVLINK_OFFBOARD:
@@ -1184,9 +1461,23 @@ def run_single(
         try:
             mav_mission = MavlinkOffboard("udpout:127.0.0.1:14580")
             if mav_mission.bind():
+                # Podniesienie limitów prędkości PX4 — inaczej OFFBOARD velocity bywa obcięty
+                # (w logach zwykle wychodzi ~12 m/s mimo większego v_cmd_ms).
+                mav_mission.set_px4_parameters(
+                    {
+                        "MPC_XY_VEL_MAX": 20.0,
+                        "MPC_Z_VEL_MAX_DN": 4.0,
+                        "MPC_Z_VEL_MAX_UP": 5.0,
+                    },
+                    repeats=3,
+                )
                 mav_mission.set_mode_offboard()
                 carb.log_info(f"Scenariusz 1: OFFBOARD, lot prosto v={v_cmd:.1f} m/s, yaw={yaw_deg:.0f}°, max {distance_m:.0f} m lub {mission_duration_s:.0f} s")
                 mission_time_s = 0.0
+                s1_first_cmd = True
+                s1_cruise_fast_since: float | None = None
+                _s1_v_frac = 0.88
+                _s1_v_sustain_s = 0.35
                 for _ in range(steps_total):
                     if not simulation_app.is_running():
                         break
@@ -1195,10 +1486,41 @@ def run_single(
                         carb.log_info(f"Scenariusz 1: przeleciono {flown:.1f} m (cel {distance_m:.0f} m)")
                     if flown >= distance_m:
                         carb.log_info(f"Scenariusz 1: przeleciano {flown:.1f} m, koniec misji.")
+                        flight_timeline.mark_once(
+                            "cruise_distance_goal_reached",
+                            step,
+                            flown_horizontal_m=flown,
+                            distance_m=distance_m,
+                        )
                         break
                     vz_sp = _mission_vz_altitude_wave(mission_time_s)
                     last_setpoint[0], last_setpoint[1], last_setpoint[2] = vx, vy, vz_sp
                     time_boot_ms = int(step * physics_dt * 1000)
+                    if s1_first_cmd:
+                        flight_timeline.mark_once(
+                            "offboard_velocity_stream_started",
+                            step,
+                            scenario_id=1,
+                            v_command_ms=float(v_cmd),
+                        )
+                        s1_first_cmd = False
+                    if vehicle is not None and getattr(vehicle, "state", None) is not None:
+                        lv = vehicle.state.linear_velocity
+                        vh1 = math.hypot(float(lv[0]), float(lv[1]))
+                        if vh1 >= float(v_cmd) * _s1_v_frac:
+                            if s1_cruise_fast_since is None:
+                                s1_cruise_fast_since = mission_time_s
+                            elif mission_time_s - s1_cruise_fast_since >= _s1_v_sustain_s:
+                                flight_timeline.mark_once(
+                                    "cruise_horizontal_speed_sustained_near_command",
+                                    step,
+                                    v_horizontal_ground_truth_ms=vh1,
+                                    v_command_ms=float(v_cmd),
+                                    sustained_threshold_frac=_s1_v_frac,
+                                    sustained_min_s=_s1_v_sustain_s,
+                                )
+                        else:
+                            s1_cruise_fast_since = None
                     mav_mission.send_velocity_target_ned(time_boot_ms, vx, vy, vz_sp)
                     _do_step()
                     log_state(step)
@@ -1243,7 +1565,7 @@ def run_single(
                     break
 
     elif not spawn_goal_reached and scenario_id == 2 and HAS_MAVLINK_OFFBOARD:
-        # Scenariusz 2: cruise (±5 % wys.) → wyrownanie_xy (vz=0) → schodzenie pionowe → AUTO LAND przy z ≤ progu.
+        # Scenariusz 2: cruise (PD wysokości z↑ Pegasus) → hamowanie (snapshot z↑) + |v_xy|→0 → PX4 AUTO LAND + NAV_LAND.
         v_cmd = float(params.get("v_cmd_ms", 10.0))
         yaw_deg = float(params.get("yaw_deg", 0.0))
         distance_m = float(params.get("distance_m", 200.0))
@@ -1254,7 +1576,10 @@ def run_single(
             tx, ty = float(tgt[0]), float(tgt[1])
             horiz_s = distance_m / max(0.1, v_cmd)
             land_to = float(params.get("land_phase_timeout_s", 180.0))
-            _need_mission_s = horiz_s + 120.0 + land_to
+            brake_to = float(params.get("land_brake_timeout_s", 70.0))
+            # Nie pozwalamy, by hamowanie przeciągało się dłużej niż 5 s.
+            brake_to = min(brake_to, 5.0)
+            _need_mission_s = horiz_s + brake_to + 100.0 + land_to
             mission_duration_s = float(duration_s)
             if mission_duration_s < _need_mission_s:
                 carb.log_warn(
@@ -1266,31 +1591,53 @@ def run_single(
             vx_cruise = v_cmd * math.cos(yaw_rad)
             vy_cruise = v_cmd * math.sin(yaw_rad)
             _alt_ref = float(params.get("altitude_m", alt_target))
-            _var_frac = min(0.05, max(0.0, float(params.get("altitude_variation_frac", 0.0) or 0.0)))
             _wobble_period = max(3.0, float(params.get("altitude_variation_period_s", 40.0) or 40.0))
-            appr_start = float(params.get("land_approach_start_m", 35.0))
-            appr_v_max = float(params.get("land_approach_v_max_ms", 4.0))
-            xy_align = float(params.get("land_xy_align_m", 4.0))
-            descend_vz = float(params.get("land_descend_vz_ms", 0.85))
-            z_auto_land = float(params.get("land_auto_land_alt_z_m", 3.0))
-            xy_drift_max = float(params.get("land_descend_xy_drift_max_m", 7.0))
+            _wobble_frac = params.get("land_cruise_z_wobble_frac")
+            if _wobble_frac is None:
+                _wobble_frac = min(0.05, max(0.0, float(params.get("altitude_variation_frac", 0.0) or 0.0)))
+            else:
+                _wobble_frac = max(0.0, float(_wobble_frac))
+            cruise_z_kp = float(params.get("land_cruise_z_hold_kp", 1.35))
+            cruise_z_kd = float(params.get("land_cruise_z_hold_kd", 0.7))
+            cruise_z_cap = float(params.get("land_cruise_z_vz_cap_ms", 3.5))
+            cruise_kp_boost = float(params.get("land_cruise_z_kp_boost", 1.9))
+            cruise_acquire_s = max(0.0, float(params.get("land_cruise_acquire_boost_s", 14.0)))
+            brake_v_stop = float(params.get("land_brake_v_stop_ms", 0.12))
+            brake_settle_s = max(0.0, float(params.get("land_brake_settle_s", 1.25)))
+            z_hold_kp = float(params.get("land_brake_z_hold_kp", 1.45))
+            z_hold_kd = float(params.get("land_brake_z_hold_kd", 0.65))
+            z_vz_cap = float(params.get("land_brake_z_vz_cap_ms", 2.2))
             z_land = float(params.get("landed_pos_z_max_m", 0.4))
             v_land = float(params.get("landed_total_speed_max_ms", 0.6))
             land_timeout_steps = int(land_to / physics_dt)
             land_stream_n = 15
-            land_align_timeout_s = float(params.get("land_align_timeout_s", 95.0))
+            s2_first_cmd = True
+            s2_cruise_fast_since: float | None = None
+            _s2_v_frac = 0.88
+            _s2_v_sustain_s = 0.35
+            s2_land_cmd_z: float | None = None
+            s2_descent_gt_marked = False
+            land_after_touchdown_s = float(params.get("land_after_touchdown_s", 2.0))
+            land_after_disarm_s = float(params.get("land_after_disarm_s", 2.0))
+            touchdown_sim_time_s: float | None = None
+            post_touchdown_disarm_sent = False
+            disarm_sent_sim_time_s: float | None = None
 
-            def _mission_vz_altitude_wave_s2(t_mission_s: float) -> float:
-                if _var_frac <= 0.0:
-                    return 0.0
-                om = 2.0 * math.pi / _wobble_period
-                return -_alt_ref * _var_frac * om * math.cos(om * t_mission_s)
-
-            def _dist_to_target_s2() -> float:
-                if vehicle is None or getattr(vehicle, "state", None) is None:
-                    return 1.0e9
-                p = vehicle.state.position
-                return math.hypot(float(p[0]) - tx, float(p[1]) - ty)
+            def _vz_ned_from_altitude_zup(
+                pz_up: float,
+                vz_up: float,
+                z_target_up: float,
+                kp: float,
+                kd: float,
+                cap: float,
+            ) -> float:
+                """
+                Pegasus/Isaac: position[2] i linear_velocity[2] to oś **w górę** (jak takeoff: z rośnie z wysokością).
+                MAVLink OFFBOARD: **vz w NED** — dodatnie = w dół. v_down = −dh/dt przy h = z_up.
+                """
+                dh_dt_cmd = kp * (z_target_up - pz_up) - kd * vz_up
+                vz_ned = -dh_dt_cmd
+                return max(-cap, min(cap, vz_ned))
 
             def _flown_spawn_s2() -> float:
                 if vehicle is None or getattr(vehicle, "state", None) is None:
@@ -1301,121 +1648,298 @@ def run_single(
                 return math.sqrt(dx * dx + dy * dy)
 
             carb.log_info(
-                f"Scenariusz 2: cel XY = ({tx:.1f}, {ty:.1f}) m (spawn+{distance_m:.0f} m, yaw {yaw_deg:.0f}°); "
-                f"wyrownanie do ≤{xy_align:.0f} m lub timeout {land_align_timeout_s:.0f}s; potem zejście + AUTO LAND."
+                f"Scenariusz 2: referencja XY celu ({tx:.1f}, {ty:.1f}) m (spawn + {distance_m:.0f} m, yaw {yaw_deg:.0f}°); "
+                f"po przeleceniu {distance_m:.0f} m — hamowanie na **tej samej wysokości**, potem **PX4 AUTO LAND + NAV_LAND**."
             )
 
             phase = "cruise"
+            mission_t0_sim = float(getattr(world, "current_time", 0.0) or 0.0)
             mission_time_s = 0.0
-            align_enter_s: float | None = None
+            brake_z_hold_ned: float | None = None
+            brake_enter_s: float | None = None
+            brake_vel_ok_since: float | None = None
             land_commanded = False
             land_steps = 0
             mav_mission = None
 
+            # Acceleration phase recognition (cruise start):
+            # „ruszanie” od małych v_xy do blisko v_cmd (Vmax w praktyce).
+            s2_acc_started = False
+            s2_acc_start_v_xy_ms: float | None = None
+            s2_acc_peak_accel_xy_m_s2: float | None = None
+            s2_acc_peak_dv_m_s: float | None = None
+            s2_acc_peak_v_before: float | None = None
+            s2_acc_peak_v_after: float | None = None
+            s2_acc_peak_step: int | None = None
+            s2_acc_prev_v_xy: float | None = None
+            s2_acc_prev_t_sim: float | None = None
+            s2_near_v_reached = False
+            s2_acc_start_v_thresh = 0.6
+            s2_acc_near_v_frac = 0.90
+
             try:
                 mav_mission = MavlinkOffboard("udpout:127.0.0.1:14580")
                 if mav_mission.bind():
+                    # Podniesienie limitów prędkości PX4 — bez tego OFFBOARD velocity bywa obcięty
+                    # i w GT wychodzi ~12 m/s niezależnie od v_cmd_ms.
+                    mav_mission.set_px4_parameters(
+                        {
+                            "MPC_XY_VEL_MAX": 20.0,
+                            "MPC_Z_VEL_MAX_DN": 4.0,
+                            "MPC_Z_VEL_MAX_UP": 5.0,
+                        },
+                        repeats=3,
+                    )
                     mav_mission.set_mode_offboard()
                     carb.log_info(
-                        f"Scenariusz 2: OFFBOARD cruise v={v_cmd:.1f} m/s, modulacja wys. ≤5 %; "
-                        f"wyrownanie_xy gdy d_do_celu ≤ {appr_start:.0f} m"
+                        f"Scenariusz 2: OFFBOARD cruise v={v_cmd:.1f} m/s, wysokość PD→{_alt_ref:.1f} m (z↑), "
+                        f"wobble celu ≤{_wobble_frac*100:.1f} %; koniec cruise przy ≥{distance_m:.0f} m od spawnu."
                     )
                     for _ in range(steps_total):
                         if not simulation_app.is_running():
                             break
-                        d_tgt = _dist_to_target_s2()
+                        mission_time_s = float(getattr(world, "current_time", 0.0) or 0.0) - mission_t0_sim
                         time_boot_ms = int(step * physics_dt * 1000)
 
                         if not land_commanded:
                             if phase == "cruise":
                                 flown = _flown_spawn_s2()
-                                if d_tgt <= appr_start or mission_time_s > horiz_s * 5.0:
-                                    phase = "align_xy"
-                                    align_enter_s = mission_time_s
-                                    carb.log_info(
-                                        f"Scenariusz 2: wyrownanie_xy — d_do_celu={d_tgt:.1f} m, z spawn ~{flown:.1f} m."
+                                if flown >= distance_m or mission_time_s > horiz_s * 5.0:
+                                    phase = "brake"
+                                    brake_enter_s = mission_time_s
+                                    brake_vel_ok_since = None
+                                    if vehicle is not None and getattr(vehicle, "state", None) is not None:
+                                        brake_z_hold_ned = float(vehicle.state.position[2])
+                                    flight_timeline.mark_once(
+                                        "brake_phase_started",
+                                        step,
+                                        flown_horizontal_m=flown,
+                                        distance_m_commanded=distance_m,
+                                        mission_timeout_s=bool(mission_time_s > horiz_s * 5.0),
                                     )
-                                vz_sp = _mission_vz_altitude_wave_s2(mission_time_s)
-                                last_setpoint[0] = vx_cruise
-                                last_setpoint[1] = vy_cruise
-                                last_setpoint[2] = vz_sp
-                                mav_mission.send_velocity_target_ned(
-                                    time_boot_ms, vx_cruise, vy_cruise, vz_sp
-                                )
-                            elif phase == "align_xy":
+                                    carb.log_info(
+                                        f"Scenariusz 2: hamowanie — przeleciano z spawnu ~{flown:.1f} m "
+                                        f"(próg {distance_m:.0f} m); hold wys. z↑="
+                                        f"{brake_z_hold_ned if brake_z_hold_ned is not None else float('nan'):.2f} m; "
+                                        f"OFFBOARD **vx=vy=0** (pełne zatrzymanie w poziomie), potem lądowanie."
+                                    )
+                                else:
+                                    z_tgt = _alt_ref
+                                    if _wobble_frac > 0.0 and _wobble_period > 0.0:
+                                        om = 2.0 * math.pi / _wobble_period
+                                        z_tgt += _alt_ref * _wobble_frac * math.sin(
+                                            om * mission_time_s
+                                        )
+                                    kp_use = (
+                                        cruise_kp_boost
+                                        if mission_time_s < cruise_acquire_s
+                                        else cruise_z_kp
+                                    )
+                                    if vehicle is None or getattr(vehicle, "state", None) is None:
+                                        vz_sp = 0.0
+                                    else:
+                                        p = vehicle.state.position
+                                        lv = vehicle.state.linear_velocity
+                                        vz_sp = _vz_ned_from_altitude_zup(
+                                            float(p[2]),
+                                            float(lv[2]),
+                                            z_tgt,
+                                            kp_use,
+                                            cruise_z_kd,
+                                            cruise_z_cap,
+                                        )
+                                    last_setpoint[0] = vx_cruise
+                                    last_setpoint[1] = vy_cruise
+                                    last_setpoint[2] = vz_sp
+                                    if s2_first_cmd:
+                                        flight_timeline.mark_once(
+                                            "offboard_velocity_stream_started",
+                                            step,
+                                            scenario_id=2,
+                                            v_command_ms=float(v_cmd),
+                                        )
+                                        s2_first_cmd = False
+                                    if vehicle is not None and getattr(vehicle, "state", None) is not None:
+                                        lv2 = vehicle.state.linear_velocity
+                                        vh2 = math.hypot(float(lv2[0]), float(lv2[1]))
+
+                                        # --- Acceleration phase recognition (cruise start) ---
+                                        if not s2_acc_started and vh2 >= s2_acc_start_v_thresh:
+                                            s2_acc_started = True
+                                            s2_acc_start_v_xy_ms = vh2
+                                            # Initialize derivative tracking right at the moment it starts.
+                                            s2_acc_prev_v_xy = vh2
+                                            s2_acc_prev_t_sim = mission_time_s
+                                            flight_timeline.mark_once(
+                                                "acceleration_phase_started",
+                                                step,
+                                                v_xy_start_m_s=vh2,
+                                                v_cmd_ms=float(v_cmd),
+                                                threshold_m_s=s2_acc_start_v_thresh,
+                                            )
+
+                                        if s2_acc_started:
+                                            if s2_acc_prev_v_xy is not None and s2_acc_prev_t_sim is not None:
+                                                dt = mission_time_s - s2_acc_prev_t_sim
+                                                if dt > 1e-4:
+                                                    dv = vh2 - float(s2_acc_prev_v_xy)
+                                                    accel_xy = dv / dt
+                                                    if (
+                                                        s2_acc_peak_accel_xy_m_s2 is None
+                                                        or accel_xy > float(s2_acc_peak_accel_xy_m_s2)
+                                                    ):
+                                                        s2_acc_peak_accel_xy_m_s2 = accel_xy
+                                                        s2_acc_peak_dv_m_s = dv
+                                                        s2_acc_peak_v_before = float(s2_acc_prev_v_xy)
+                                                        s2_acc_peak_v_after = vh2
+                                                        s2_acc_peak_step = step
+                                                        flight_timeline.mark(
+                                                            "acceleration_peak_updated",
+                                                            step,
+                                                            accel_xy_m_s2=accel_xy,
+                                                            dv_m_s=dv,
+                                                            v_xy_before_m_s=float(s2_acc_peak_v_before)
+                                                            if s2_acc_peak_v_before is not None
+                                                            else None,
+                                                            v_xy_after_m_s=float(s2_acc_peak_v_after)
+                                                            if s2_acc_peak_v_after is not None
+                                                            else None,
+                                                        )
+
+                                            s2_acc_prev_v_xy = vh2
+                                            s2_acc_prev_t_sim = mission_time_s
+
+                                        if (not s2_near_v_reached) and vh2 >= float(v_cmd) * s2_acc_near_v_frac:
+                                            s2_near_v_reached = True
+                                            dv_from_start = None
+                                            if s2_acc_start_v_xy_ms is not None:
+                                                dv_from_start = vh2 - s2_acc_start_v_xy_ms
+                                            flight_timeline.mark_once(
+                                                "acceleration_near_vmax_reached",
+                                                step,
+                                                v_xy_near_vmax_m_s=vh2,
+                                                v_cmd_ms=float(v_cmd),
+                                                dv_from_acc_start_m_s=dv_from_start,
+                                                peak_accel_xy_m_s2=float(s2_acc_peak_accel_xy_m_s2)
+                                                if s2_acc_peak_accel_xy_m_s2 is not None
+                                                else None,
+                                                peak_dv_m_s=float(s2_acc_peak_dv_m_s)
+                                                if s2_acc_peak_dv_m_s is not None
+                                                else None,
+                                            )
+
+                                        if vh2 >= float(v_cmd) * _s2_v_frac:
+                                            if s2_cruise_fast_since is None:
+                                                s2_cruise_fast_since = mission_time_s
+                                            elif mission_time_s - s2_cruise_fast_since >= _s2_v_sustain_s:
+                                                flight_timeline.mark_once(
+                                                    "cruise_horizontal_speed_sustained_near_command",
+                                                    step,
+                                                    v_horizontal_ground_truth_ms=vh2,
+                                                    v_command_ms=float(v_cmd),
+                                                    sustained_threshold_frac=_s2_v_frac,
+                                                    sustained_min_s=_s2_v_sustain_s,
+                                                )
+                                        else:
+                                            s2_cruise_fast_since = None
+                                    mav_mission.send_velocity_target_ned(
+                                        time_boot_ms, vx_cruise, vy_cruise, vz_sp
+                                    )
+                            # Osobno od cruise: po przejściu cruise→brake w tej samej iteracji wyślij hamowanie (nie elif).
+                            if phase == "brake":
                                 if vehicle is None or getattr(vehicle, "state", None) is None:
                                     break
-                                p = vehicle.state.position
-                                px, py = float(p[0]), float(p[1])
-                                dx = tx - px
-                                dy = ty - py
-                                dist = math.hypot(dx, dy)
-                                _align_elapsed = (
-                                    (mission_time_s - align_enter_s)
-                                    if align_enter_s is not None
+                                lv = vehicle.state.linear_velocity
+                                vx = float(lv[0])
+                                vy = float(lv[1])
+                                vz_meas = float(lv[2])
+                                pz = float(vehicle.state.position[2])
+                                if brake_z_hold_ned is None:
+                                    brake_z_hold_ned = pz
+                                vz_sp = _vz_ned_from_altitude_zup(
+                                    pz, vz_meas, brake_z_hold_ned, z_hold_kp, z_hold_kd, z_vz_cap
+                                )
+                                v_h = math.hypot(vx, vy)
+                                b_el = (
+                                    (mission_time_s - brake_enter_s)
+                                    if brake_enter_s is not None
                                     else 0.0
                                 )
-                                if dist <= xy_align or _align_elapsed > land_align_timeout_s:
-                                    if dist > xy_align:
-                                        carb.log_warn(
-                                            f"Scenariusz 2: timeout wyrownania XY ({_align_elapsed:.0f}s), "
-                                            f"d_xy={dist:.1f} m — start schodzenia."
-                                        )
-                                    phase = "descend"
-                                    carb.log_info(f"Scenariusz 2: schodzenie (d_xy={dist:.2f} m).")
+                                if v_h <= brake_v_stop:
+                                    if brake_vel_ok_since is None:
+                                        brake_vel_ok_since = mission_time_s
                                 else:
-                                    v_cap = min(appr_v_max, max(0.5, 0.42 * dist))
-                                    vx_ap = v_cap * dx / dist if dist > 0.05 else 0.0
-                                    vy_ap = v_cap * dy / dist if dist > 0.05 else 0.0
-                                    last_setpoint[0] = vx_ap
-                                    last_setpoint[1] = vy_ap
-                                    last_setpoint[2] = 0.0
-                                    mav_mission.send_velocity_target_ned(
-                                        time_boot_ms, vx_ap, vy_ap, 0.0
+                                    brake_vel_ok_since = None
+                                settled = (
+                                    brake_vel_ok_since is not None
+                                    and (mission_time_s - brake_vel_ok_since) >= brake_settle_s
+                                )
+                                if settled or b_el > brake_to:
+                                    if settled:
+                                        flight_timeline.mark_once(
+                                            "brake_horizontal_stabilized",
+                                            step,
+                                            v_xy_horizontal_ms=v_h,
+                                            brake_settle_s=brake_settle_s,
+                                        )
+                                    if not settled and b_el > brake_to:
+                                        carb.log_warn(
+                                            f"Scenariusz 2: timeout hamowania ({b_el:.0f}s), |v_xy|={v_h:.2f} m/s — wymuszam lądowanie PX4."
+                                        )
+                                        flight_timeline.mark_once(
+                                            "brake_timeout_forcing_land",
+                                            step,
+                                            v_xy_horizontal_ms=v_h,
+                                            brake_elapsed_s=b_el,
+                                        )
+                                    if (
+                                        vehicle is not None
+                                        and getattr(vehicle, "state", None) is not None
+                                    ):
+                                        s2_land_cmd_z = float(vehicle.state.position[2])
+                                    ok_land = mav_mission.set_mode_auto_land_px4()
+                                    ok_cmd = mav_mission.send_nav_land_in_place()
+                                    flight_timeline.mark_once(
+                                        "px4_auto_land_mode_command_sent",
+                                        step,
+                                        mavlink_ok=bool(ok_land),
                                     )
-                            else:
-                                if vehicle is None or getattr(vehicle, "state", None) is None:
-                                    break
-                                p = vehicle.state.position
-                                px, py = float(p[0]), float(p[1])
-                                pz = float(p[2])
-                                if pz <= z_auto_land:
-                                    carb.log_info(
-                                        f"Scenariusz 2: z={pz:.2f} m ≤ {z_auto_land:.1f} m — AUTO LAND (PX4)."
+                                    flight_timeline.mark_once(
+                                        "px4_nav_land_command_sent",
+                                        step,
+                                        mavlink_ok=bool(ok_cmd),
                                     )
-                                    mav_mission.set_mode_auto_land_px4()
                                     land_commanded = True
                                     land_steps = 0
                                     last_setpoint[:] = [0.0, 0.0, 0.0]
+                                    carb.log_info(
+                                        "Scenariusz 2: po zatrzymaniu — "
+                                        f"AUTO LAND={'OK' if ok_land else 'fail'}, NAV_LAND={'OK' if ok_cmd else 'fail'}; "
+                                        + (
+                                            f"|v_xy|≤{brake_v_stop:.2f} m/s przez ≥{brake_settle_s:.1f} s."
+                                            if settled
+                                            else "timeout hamowania."
+                                        )
+                                    )
                                 else:
-                                    dx = tx - px
-                                    dy = ty - py
-                                    dh = math.hypot(dx, dy)
-                                    vx_d = 0.0
-                                    vy_d = 0.0
-                                    if dh > xy_drift_max and dh > 0.05:
-                                        vn = min(1.2, 0.2 * (dh - xy_drift_max))
-                                        vx_d = vn * dx / dh
-                                        vy_d = vn * dy / dh
-                                    vz_sp = descend_vz
-                                    last_setpoint[0] = vx_d
-                                    last_setpoint[1] = vy_d
+                                    # Pełne zatrzymanie w poziomie (nie −k·v — to powodowało „skręt” i dalszy lot).
+                                    vx_sp = 0.0
+                                    vy_sp = 0.0
+                                    last_setpoint[0] = vx_sp
+                                    last_setpoint[1] = vy_sp
                                     last_setpoint[2] = vz_sp
                                     mav_mission.send_velocity_target_ned(
-                                        time_boot_ms, vx_d, vy_d, vz_sp
+                                        time_boot_ms, vx_sp, vy_sp, vz_sp
                                     )
                         elif mav_mission is not None and land_stream_n > 0:
                             last_setpoint[:] = [0.0, 0.0, 0.0]
                             mav_mission.send_velocity_target_ned(time_boot_ms, 0.0, 0.0, 0.0)
                             land_stream_n -= 1
-                            if land_stream_n == 0:
-                                mav_mission.close()
-                                mav_mission = None
+                            # Nie zamykaj tutaj — potrzebne jest połączenie do DISARM po touchdown.
 
                         _do_step()
                         log_state(step)
                         step += 1
-                        mission_time_s += physics_dt
                         if land_commanded:
                             land_steps += 1
                             if vehicle is not None and getattr(vehicle, "state", None) is not None:
@@ -1424,11 +1948,62 @@ def run_single(
                                 spd = math.sqrt(
                                     float(lv[0]) ** 2 + float(lv[1]) ** 2 + float(lv[2]) ** 2
                                 )
-                                if float(p[2]) <= z_land and spd < v_land:
+                                if (
+                                    s2_land_cmd_z is not None
+                                    and not s2_descent_gt_marked
+                                    and float(p[2]) < float(s2_land_cmd_z) - 0.35
+                                ):
+                                    flight_timeline.mark_once(
+                                        "vertical_descent_ground_truth_started",
+                                        step,
+                                        z_at_land_command_m=float(s2_land_cmd_z),
+                                        z_now_m=float(p[2]),
+                                    )
+                                    s2_descent_gt_marked = True
+                                now_sim_t = float(getattr(world, "current_time", 0.0) or 0.0)
+                                if touchdown_sim_time_s is None and float(p[2]) <= z_land and spd < v_land:
+                                    flight_timeline.mark_once(
+                                        "touchdown_stable_ground_truth",
+                                        step,
+                                        pos_z_m=float(p[2]),
+                                        total_speed_ms=spd,
+                                    )
                                     carb.log_info(
                                         f"Scenariusz 2: zakończono po lądowaniu (z≤{z_land:.2f} m, |v|<{v_land:.2f} m/s)."
                                     )
-                                    break
+                                    touchdown_sim_time_s = now_sim_t
+                                # Po touchdown: N s → DISARM → M s → koniec run (CSV dalej do końca).
+                                if touchdown_sim_time_s is not None:
+                                    dt_td = now_sim_t - touchdown_sim_time_s
+                                    if dt_td >= land_after_touchdown_s and not post_touchdown_disarm_sent:
+                                        ok_d = False
+                                        if mav_mission is not None:
+                                            ok_d = bool(mav_mission.disarm())
+                                        else:
+                                            m_dis = MavlinkOffboard("udpout:127.0.0.1:14580")
+                                            if m_dis.bind():
+                                                ok_d = bool(m_dis.disarm_px4_sitl_default())
+                                                m_dis.close()
+                                        post_touchdown_disarm_sent = True
+                                        disarm_sent_sim_time_s = now_sim_t
+                                        flight_timeline.mark_once(
+                                            "px4_disarm_command_sent",
+                                            step,
+                                            mavlink_ok=bool(ok_d),
+                                        )
+                                        carb.log_info(
+                                            f"Scenariusz 2: DISARM po {land_after_touchdown_s:.2f}s od touchdown "
+                                            f"(MAVLink ok={ok_d})."
+                                        )
+                                    if (
+                                        post_touchdown_disarm_sent
+                                        and disarm_sent_sim_time_s is not None
+                                        and (now_sim_t - disarm_sent_sim_time_s) >= land_after_disarm_s
+                                    ):
+                                        carb.log_info(
+                                            f"Scenariusz 2: koniec run po {land_after_disarm_s:.2f}s od DISARM."
+                                        )
+                                        break
                             if land_steps >= land_timeout_steps:
                                 carb.log_warn("Scenariusz 2: timeout fazy lądowania — kończę run.")
                                 break
@@ -1454,6 +2029,25 @@ def run_single(
             _do_step()
             log_state(step)
             step += 1
+
+    try:
+        _tl_meta: dict[str, Any] = {
+            "commanded_cruise_speed_ms": float(params.get("v_cmd_ms", 0.0) or 0.0),
+            "speed_measurement_note": (
+                "v_horizontal_ground_truth_ms is from Pegasus/Isaac linear_velocity XY (NED). "
+                "It is often below v_cmd_ms: PX4 OFFBOARD does not instantly match horizontal setpoint; wind and climb matter."
+            ),
+        }
+        _save_flight_timeline_json(
+            flight_timeline,
+            csv_path,
+            scenario_id,
+            run_id,
+            run_start_time,
+            _tl_meta,
+        )
+    except Exception as e:
+        carb.log_warn(f"Stachometr: flight_timeline zapis: {e}")
 
     log_file.close()
     if live_display:
@@ -1493,6 +2087,7 @@ def main():
             wind_suffix="wind" if wind_enabled else "nowind",
             show_live_display=show_live,
             random_seed=args.seed,
+            ground_extent_xy_m=float(getattr(args, "ground_extent_m", 2000.0)),
         )
         carb.log_info("Stachometr: zakończono (scenariusz 1, parametry ustalone).")
         timeline = omni.timeline.get_timeline_interface()
@@ -1528,6 +2123,7 @@ def main():
                 wind_suffix="wind",
                 show_live_display=show_live,
                 random_seed=seed,
+                ground_extent_xy_m=float(getattr(args, "ground_extent_m", 2000.0)),
             )
         else:
             run_single(
@@ -1541,6 +2137,7 @@ def main():
                 wind_suffix=None,
                 show_live_display=show_live,
                 random_seed=seed,
+                ground_extent_xy_m=float(getattr(args, "ground_extent_m", 2000.0)),
             )
 
         # Po pierwszym runie w trybie wielokrotnym nie zamykamy app — robimy clear_scene i kolejny run

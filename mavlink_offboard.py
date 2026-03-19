@@ -123,6 +123,33 @@ class MavlinkOffboard:
         )
         return True
 
+    def disarm(self) -> bool:
+        """Wysyła komendę DISARM (MAV_CMD_COMPONENT_ARM_DISARM, param1=0)."""
+        if self._conn is None:
+            return False
+        self._conn.mav.command_long_send(
+            self._target_system,
+            self._target_component,
+            mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        )
+        return True
+
+    def disarm_px4_sitl_default(self) -> bool:
+        """DISARM z target_system=1 (SITL), gdy nie było heartbeat / znanych adresów."""
+        if self._conn is None:
+            return False
+        self._target_system = 1
+        self._target_component = 1
+        return self.disarm()
+
     def takeoff(self, altitude_m: float = 10.0) -> bool:
         """Wysyła komendę TAKEOFF (MAV_CMD_NAV_TAKEOFF). altitude_m w metrach (AMSL lub względem startu w zależności od ramy)."""
         if self._conn is None:
@@ -162,6 +189,29 @@ class MavlinkOffboard:
         )
         return True
 
+    def send_nav_land_in_place(self) -> bool:
+        """
+        Wysyła MAV_CMD_NAV_LAND — PX4 ląduje w bieżącej pozycji (parametry globalne jako NaN).
+        Użyteczne po zatrzymaniu w powietrzu, gdy sam AUTO LAND nie wystartuje zejścia.
+        """
+        if self._conn is None:
+            return False
+        nan = float("nan")
+        self._conn.mav.command_long_send(
+            self._target_system,
+            self._target_component,
+            mavutil.mavlink.MAV_CMD_NAV_LAND,
+            0,
+            0.0,
+            0.0,
+            0.0,
+            nan,
+            nan,
+            nan,
+            nan,
+        )
+        return True
+
     def send_position_target_local_ned(
         self,
         time_boot_ms: int,
@@ -193,6 +243,40 @@ class MavlinkOffboard:
         return self.send_position_target_local_ned(
             time_boot_ms, 0, 0, 0, vx, vy, vz, type_mask=vel_only_mask,
         )
+
+    def set_px4_parameters(self, params: dict[str, float], repeats: int = 3) -> bool:
+        """
+        Ustawia parametry PX4 przez MAVLink PARAM_SET.
+
+        Uwaga: PX4 może być „wrażliwe” na zmiany parametrów w trakcie lotu/trybów,
+        dlatego domyślnie wysyłamy je kilka razy.
+        """
+        if self._conn is None:
+            return False
+
+        # Pymavlink: MAV_PARAM_TYPE_REAL32 = float
+        try:
+            param_type = mavutil.mavlink.MAV_PARAM_TYPE_REAL32
+        except Exception:
+            param_type = 9  # fallback: najczęściej REAL32
+
+        ok = True
+        # Param id ma maks długość 16 znaków w MAVLink (bez null-terminacji).
+        items = [(str(k)[:16], float(v)) for k, v in params.items()]
+        for _ in range(max(1, int(repeats))):
+            for param_id, param_value in items:
+                try:
+                    self._conn.mav.param_set_send(
+                        self._target_system,
+                        self._target_component,
+                        param_id,
+                        param_value,
+                        param_type,
+                    )
+                except Exception:
+                    ok = False
+            time.sleep(0.02)
+        return ok
 
     def close(self) -> None:
         if self._conn is not None:

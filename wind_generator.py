@@ -3,7 +3,8 @@
 Generator prędkości wiatru w NED dla Stachometra: średnia (meteo) + turbulencja OU + podmuchy 1−cos (+ lulls).
 
 Obwiednia podmuchu: dwa odcinki cosinusowe (narastanie do szczytu w t_peak, potem opadanie do zera).
-Losowe podmuchy: losowe T ∈ [T_min, T_max] oraz losowy moment szczytu (peak_frac ∈ [peak_frac_min, peak_frac_max]).
+Losowe podmuchy: albo jawne czasy narastania/opadania + zakres amplitudy A, albo (legacy) losowe T ∈ [T_min, T_max]
+oraz losowy moment szczytu (peak_frac ∈ [peak_frac_min, peak_frac_max]).
 """
 from __future__ import annotations
 
@@ -100,13 +101,35 @@ class DynamicWindGenerator:
         self._gust_prob_per_s = max(0.0, float(params.get("wind_gust_prob_per_s", 0.02)))
         self._gust_T_min = max(1e-3, float(params.get("wind_gust_T_min_s", 2.0)))
         self._gust_T_max = max(self._gust_T_min, float(params.get("wind_gust_T_max_s", 15.0)))
-        self._gust_A_rel_ms = max(0.0, float(params.get("wind_gust_A_rel_ms", 2.0)))
+        # Amplituda wzdłuż średniego: U(A_min, A_max) lub pojedyncze wind_gust_A_rel_ms (min=max).
+        a_single = float(params.get("wind_gust_A_rel_ms", 2.0))
+        a_min_p = params.get("wind_gust_A_rel_min_ms")
+        a_max_p = params.get("wind_gust_A_rel_max_ms")
+        if a_min_p is not None or a_max_p is not None:
+            self._gust_A_min = max(0.0, float(a_min_p if a_min_p is not None else a_single))
+            self._gust_A_max = max(self._gust_A_min, float(a_max_p if a_max_p is not None else a_single))
+        else:
+            self._gust_A_min = self._gust_A_max = max(0.0, a_single)
         self._peak_frac_min = float(params.get("wind_gust_peak_frac_min", 0.1))
         self._peak_frac_max = float(params.get("wind_gust_peak_frac_max", 0.9))
         if self._peak_frac_max < self._peak_frac_min:
             self._peak_frac_min, self._peak_frac_max = self._peak_frac_max, self._peak_frac_min
         self._peak_frac_min = max(0.02, min(0.98, self._peak_frac_min))
         self._peak_frac_max = max(self._peak_frac_min, min(0.98, self._peak_frac_max))
+        # Jawny czas narastania do szczytu (sekundy symulacji); jeśli oba skonfigurowane → losowe podmuchy ignorują peak_frac×T.
+        gr0 = params.get("wind_gust_rise_time_min_s")
+        gr1 = params.get("wind_gust_rise_time_max_s")
+        self._gust_rise_mode = gr0 is not None and gr1 is not None
+        if self._gust_rise_mode:
+            self._gust_rise_min = max(1e-3, float(gr0))
+            self._gust_rise_max = max(self._gust_rise_min, float(gr1))
+            gf0 = params.get("wind_gust_fall_time_min_s", gr0)
+            gf1 = params.get("wind_gust_fall_time_max_s", gr1)
+            self._gust_fall_min = max(1e-3, float(gf0))
+            self._gust_fall_max = max(self._gust_fall_min, float(gf1))
+        else:
+            self._gust_rise_min = self._gust_rise_max = 0.0
+            self._gust_fall_min = self._gust_fall_max = 0.0
         self._lull_enabled = bool(params.get("wind_gust_lull_enabled", True))
         self._lull_prob = float(params.get("wind_gust_lull_prob", 0.35))  # część podmuchów to lull
 
@@ -172,15 +195,23 @@ class DynamicWindGenerator:
     def _try_spawn_gust(self, dt: float) -> None:
         if self._active is not None or not self._random_gusts_enabled:
             return
-        if self._gust_prob_per_s <= 0.0 or self._gust_A_rel_ms <= 0.0:
+        if self._gust_prob_per_s <= 0.0 or self._gust_A_max <= 0.0:
             return
         p = 1.0 - math.exp(-self._gust_prob_per_s * max(dt, 0.0))
         if self._rng.random() >= p:
             return
-        T = self._rng.uniform(self._gust_T_min, self._gust_T_max)
-        pf = self._rng.uniform(self._peak_frac_min, self._peak_frac_max)
-        t_peak = _clamp_t_peak_s(T, pf * T)
-        A = self._gust_A_rel_ms
+        if self._gust_rise_mode:
+            t_peak = self._rng.uniform(self._gust_rise_min, self._gust_rise_max)
+            t_fall = self._rng.uniform(self._gust_fall_min, self._gust_fall_max)
+            T = t_peak + t_fall
+            T = max(self._gust_T_min, min(self._gust_T_max, T))
+            # Zachowaj t_peak ≤ T−eps (clamp z _clamp_t_peak_s).
+            t_peak = _clamp_t_peak_s(T, t_peak)
+        else:
+            T = self._rng.uniform(self._gust_T_min, self._gust_T_max)
+            pf = self._rng.uniform(self._peak_frac_min, self._peak_frac_max)
+            t_peak = _clamp_t_peak_s(T, pf * T)
+        A = self._rng.uniform(self._gust_A_min, self._gust_A_max)
         if self._lull_enabled and self._rng.random() < self._lull_prob:
             A = -abs(A)
         peak_vec = (A * self._u_mean[0], A * self._u_mean[1], 0.0)
