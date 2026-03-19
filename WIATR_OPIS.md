@@ -7,6 +7,12 @@
 - **Zegarek na ścianie** może iść **znacznie wolniej**: jeden krok PhysX + rendering + Pegasus/PX4 często trwa **dłużej** niż `physics_dt` (np. 4 ms) w rzeczywistości. Wtedy **1 s w `time_s` zajmuje np. 3–10 s rzeczywistych** (współczynnik czasu rzeczywistego RTF ≪ 1). To normalne przy GUI i ciężkiej scenie; w headless bywa bliżej 1:1, ale bez gwarancji.
 - Jeśli potrzebujesz, żeby **15 s podmuchu = 15 s na stoperze**, trzeba by **sztucznie synchronizować** symulację z czasem rzeczywistym (osobny temat — Stachometr tego nie wymusza).
 
+## Panel na żywo (8765): średnia vs bieżący wiatr
+
+- **`wind_speed_ms` w kolumnie „Parametry”** to **średnia z losowania** (baza OU + podmuchów) — **nie zmienia się** w trakcie runu.
+- **Zmienny wiatr w symulacji** jest w sekcji **„Wiatr (symulacja, bieżąco)”**: **`wiatr_bieżący_m/s`**, **`wind_vel_n`**, **`wind_vel_e`** — te same wartości co kolumny `wind_vel_*` w CSV.
+- Gdy **`wind_dynamic_enabled: true`**, generator **zawsze** jest krokowany co `physics_dt`; wcześniej przy braku prima PhysX log/panel mogły pokazywać zera — to poprawione: bieżący wektor i tak pochodzi z generatora.
+
 ## Stan do tej pory (przed implementacją fizyki wiatru)
 
 **Wiatr nie był stosowany do symulacji fizyki.** W kodzie:

@@ -62,12 +62,14 @@ K_WIND_N_PER_MS = _WIND_LEGACY_K_N_PER_MS * (_WIND_LEGACY_PARAM_MS / _WIND_LEGAC
 DEFAULT_WIND_PHYSICS_PARAMS: dict[str, Any] = {
     "wind_force_model": "legacy",  # "legacy" | "drag"
     "wind_dynamic_enabled": True,
-    "wind_tau_s": 0.3,
-    "wind_sigma_ms": 0.4,
-    "wind_gust_prob_per_s": 0.02,
+    # OU: umiarkowana zmienność (bez „szalonego” skoku); większe tau = wolniejszy dryf kierunku
+    "wind_tau_s": 0.55,
+    "wind_sigma_ms": 0.28,
+    "wind_gust_prob_per_s": 0.018,
     "wind_gust_T_min_s": 2.0,
     "wind_gust_T_max_s": 15.0,
-    "wind_gust_A_rel_ms": 2.0,
+    # Amplituda podmuchu wzdłuż średniego — zmniejszona vs 2.0, żeby nie skakało o kilka m/s naraz
+    "wind_gust_A_rel_ms": 1.15,
     # Losowy moment szczytu podmuchu: peak_frac * T, peak_frac ∈ [min, max] (losowe Poisson).
     "wind_gust_peak_frac_min": 0.1,
     "wind_gust_peak_frac_max": 0.9,
@@ -101,8 +103,8 @@ SCENARIO_1_FIXED = {
     "wind_dynamic_enabled": True,
     # Turbulencja OU: większe tau / mniejsze sigma → wolniejsza zmiana kierunku „z którego wieje” na panelu (nadal chwilowy wektor).
     # Przy bardzo słabej średniej (np. 1 m/s) i dużym sigma domyślne składowa wzdłużna często wpada w obcięcie (along≥0) → skoki kierunku ~90°.
-    "wind_tau_s": 2.0,
-    "wind_sigma_ms": 0.18,
+    "wind_tau_s": 1.4,
+    "wind_sigma_ms": 0.26,
     # Harmonogram: opcjonalnie "peak_fraction" (0–1) = część duration do szczytu; brak → szczyt w połowie (symetrycznie).
     "wind_gust_schedule": [
         {"t_start_s": 11.67, "duration_s": 9.5, "A_rel_ms": 3, "peak_fraction": 0.35},

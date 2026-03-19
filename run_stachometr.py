@@ -218,9 +218,16 @@ function refresh() {
       v +
       '</td></tr>';
     const WIND_KEYS = ['wiatr', 'param_wind_speed_ms', 'param_wind_dir_deg', 'param_wind_dynamic_enabled', 'param_wind_force_model'];
+    const WIND_PARAM_LABELS = {
+      'param_wind_speed_ms': 'wind_speed_ms — średnia bazy (nie to co |w| w locie)',
+      'param_wind_dir_deg': 'wind_dir_deg — średni kierunek (meteo)',
+      'param_wind_dynamic_enabled': 'wind_dynamic_enabled',
+      'param_wind_force_model': 'wind_force_model',
+      'wiatr': 'wiatr (run z plikiem *_wind)',
+    };
     const LEFT = [
       { lab: 'Czas i dystans', keys: ['czas_symulacji_s', 'czas_rzeczywisty_s', 'przeleciono_m', 'cel_m'] },
-      { lab: 'Wiatr (symulacja, bieżąco)', keys: ['wiatr_bieżący_m/s', 'wiatr_z_którego_°', 'wiatr_podmuch_aktywny', 'wiatr_faza_podmuchu', 'wiatr_podmuch_narasta', 'wiatr_podmuch_z_planu', 'wiatr_zelżenie'] },
+      { lab: 'Wiatr (symulacja, bieżąco)', keys: ['wiatr_bieżący_m/s', 'wind_vel_n', 'wind_vel_e', 'wiatr_z_którego_°', 'wiatr_podmuch_aktywny', 'wiatr_faza_podmuchu', 'wiatr_podmuch_narasta', 'wiatr_podmuch_z_planu', 'wiatr_zelżenie'] },
       { lab: 'Prędkość (GT)', keys: ['vel_x', 'vel_y', 'vel_z'] },
       { lab: 'Barometr', keys: ['baro_pressure_hPa', 'baro_temp_C', 'baro_alt_m'] },
       { lab: 'Żyroskop (body)', keys: ['gyro_x', 'gyro_y', 'gyro_z'] },
@@ -250,7 +257,11 @@ function refresh() {
     const rest = Object.entries(d).filter(([k]) => !k.startsWith('param_') && !seen.has(k));
     if (rest.length) readingsHtml += '<h3>Inne</h3><table class="kv-table">' + rest.map(([k, v]) => row(k, v)).join('') + '</table>';
     document.getElementById('readings').innerHTML = readingsHtml;
-    const windRows = WIND_KEYS.filter(k => k in d).map(k => row(k, d[k])).join('');
+    const windRow = (k, v) => {
+      const lab = WIND_PARAM_LABELS[k] || String(k).replace(/^param_/, '');
+      return '<tr><td class="kv-k">' + lab + '</td><td class="kv-v">' + v + '</td></tr>';
+    };
+    const windRows = WIND_KEYS.filter(k => k in d).map(k => windRow(k, d[k])).join('');
     let paramsHtml = '<h2>Parametry scenariusza</h2>';
     if (windRows) paramsHtml += '<h3>Wiatr</h3><table class="kv-table">' + windRows + '</table>';
     if (paramKeys.length) paramsHtml += '<h3>Ustawienia</h3><table class="kv-table">' + paramKeys.map(([k, v]) => row(k, v)).join('') + '</table>';
@@ -399,8 +410,10 @@ class _LiveDisplay:
                 wn = float(wind_snapshot.get("wind_vel_n", 0.0))
                 we = float(wind_snapshot.get("wind_vel_e", 0.0))
                 spd = math.hypot(wn, we)
-                data["wiatr_bieżący_m/s"] = f"{spd:.2f}"
-                data["wiatr_z_którego_°"] = f"{_meteo_wind_from_deg(wn, we):.1f}"
+                data["wiatr_bieżący_m/s"] = f"{spd:.3f}"
+                data["wind_vel_n"] = f"{wn:.3f}"
+                data["wind_vel_e"] = f"{we:.3f}"
+                data["wiatr_z_którego_°"] = f"{_meteo_wind_from_deg(wn, we):.2f}"
                 gp = wind_snapshot.get("wind_gust_phase", "") or ""
                 ig = int(wind_snapshot.get("wind_is_gust", 0) or 0)
                 data["wiatr_podmuch_aktywny"] = "tak" if ig else "nie"
@@ -803,9 +816,9 @@ def run_single(
                 carb.log_warn(f"Stachometr: wiatr PhysX init: {e}")
 
     def _apply_wind_force():
-        """Siła wiatru w świecie PhysX; aktualizuje last_wind_log do CSV."""
+        """Siła wiatru w PhysX; **zawsze** aktualizuje last_wind_log z krokiem generatora (OU+podmuchy), nawet gdy brak prima — wtedy tylko brak apply_force."""
         nonlocal _wind_apply_pos_warned, last_wind_log
-        if _wind_body_id is None or _wind_stage_id is None or _wind_gen is None:
+        if _wind_gen is None:
             last_wind_log = {
                 "wind_vel_n": 0.0,
                 "wind_vel_e": 0.0,
@@ -868,6 +881,13 @@ def run_single(
                 "wind_gust_from_schedule": int(ex.get("wind_gust_from_schedule", 0) or 0),
                 "wind_gust_is_lull": int(ex.get("wind_gust_is_lull", 0) or 0),
             }
+            if _wind_body_id is None or _wind_stage_id is None:
+                if not _wind_apply_pos_warned:
+                    carb.log_warn(
+                        "Stachometr: wiatr — brak prima PhysX; generator nadal krokowany (CSV/panel), bez apply_force."
+                    )
+                    _wind_apply_pos_warned = True
+                return
             if apply_at is None:
                 if not _wind_apply_pos_warned:
                     carb.log_warn(
