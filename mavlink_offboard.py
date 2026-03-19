@@ -78,6 +78,14 @@ class MavlinkOffboard:
     def is_connected(self) -> bool:
         return self._conn is not None
 
+    def force_px4_sitl_target(self) -> bool:
+        """Wymusza target MAVLink na PX4 SITL autopilot (sys=1, comp=1)."""
+        if self._conn is None:
+            return False
+        self._target_system = 1
+        self._target_component = 1
+        return True
+
     # PX4 custom_mode: union { reserved(uint16), main_mode(uint8), sub_mode(uint8) } → (main<<16)|(sub<<24)
     # MAIN_MODE_AUTO=4, SUB_MODE_AUTO_TAKEOFF=2 → Takeoff
     PX4_CUSTOM_MODE_TAKEOFF = (4 << 16) | (2 << 24)
@@ -277,6 +285,57 @@ class MavlinkOffboard:
                     ok = False
             time.sleep(0.02)
         return ok
+
+    def read_px4_param(self, param_id: str, timeout_s: float = 1.0) -> Optional[float]:
+        """
+        Odczytuje pojedynczy parametr PX4 przez MAVLink PARAM_REQUEST_READ.
+
+        Zwraca float (param_value) lub None, jeśli timeout / brak odpowiedzi.
+        """
+        if self._conn is None:
+            return None
+
+        pid = str(param_id)[:16]
+        try:
+            self._conn.mav.param_request_read_send(
+                self._target_system,
+                self._target_component,
+                pid,
+                -1,  # param index: -1 = "latest"
+            )
+        except Exception:
+            return None
+
+        t0 = time.time()
+        while time.time() - t0 < float(timeout_s):
+            try:
+                msg = self._conn.recv_match(type="PARAM_VALUE", blocking=True, timeout=0.1)
+            except Exception:
+                msg = None
+            if msg is None:
+                continue
+            try:
+                got_id = getattr(msg, "param_id", None)
+                # pymavlink bywa: bytes / str + padding null-ami
+                if isinstance(got_id, bytes):
+                    got_id = got_id.decode("utf-8", errors="ignore")
+                got_id = str(got_id).replace("\x00", "")
+                if got_id[:16] == pid:
+                    return float(getattr(msg, "param_value", None))
+            except Exception:
+                continue
+        return None
+
+    def read_px4_params(self, param_ids: list[str], timeout_s: float = 1.0) -> dict[str, float]:
+        """
+        Odczytuje listę parametrów (kolejno) i zwraca tylko te, które udało się odczytać.
+        """
+        out: dict[str, float] = {}
+        for pid in param_ids:
+            v = self.read_px4_param(pid, timeout_s=timeout_s)
+            if v is not None:
+                out[pid] = v
+        return out
 
     def close(self) -> None:
         if self._conn is not None:

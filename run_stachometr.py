@@ -137,26 +137,32 @@ def _px4_velocity_mission_limits(params: dict[str, Any], v_cmd_ms: float) -> dic
     v = max(0.1, float(v_cmd_ms))
     xy_raw = params.get("px4_mpc_xy_vel_max")
     if xy_raw is None:
-        # Zapas na śledzenie setpointu + wiatr; must-have: v_cmd do 30 m/s
-        mpc_xy = max(v + 10.0, 15.0)
+        # Zapas na śledzenie setpointu + wiatr; must-have: v_cmd do 30 m/s.
+        # W poprzedniej wersji ~20 m/s bywało widoczne w GT (PX4 sufit).
+        # Dajemy wyraźnie wyższy limit, żeby nie klamrować setpointu.
+        mpc_xy = max(v * 2.0 + 10.0, 45.0)
     else:
         mpc_xy = float(xy_raw)
-    mpc_xy = max(mpc_xy, v + 2.0)
+    mpc_xy = max(mpc_xy, v + 5.0)
 
     zdn_raw = params.get("px4_mpc_z_vel_max_dn")
     if zdn_raw is None:
-        mpc_z_dn = max(5.0, 4.0 + 0.12 * min(v, 30.0))
+        mpc_z_dn = 6.0 + 0.20 * min(v, 30.0)
     else:
         mpc_z_dn = float(zdn_raw)
 
     zup_raw = params.get("px4_mpc_z_vel_max_up")
     if zup_raw is None:
-        mpc_z_up = max(6.0, 5.0 + 0.12 * min(v, 30.0))
+        mpc_z_up = 7.0 + 0.20 * min(v, 30.0)
     else:
         mpc_z_up = float(zup_raw)
 
     out: dict[str, float] = {
         "MPC_XY_VEL_MAX": mpc_xy,
+        # Dodatkowe prędkości horyzontalne (część ścieżek kontrolera odnosi się do tych limitów).
+        # Trzymamy je <= MPC_XY_VEL_MAX, ale wystarczająco wysoko dla v_cmd.
+        "MPC_XY_CRUISE": min(mpc_xy, max(v, 8.0)),
+        "MPC_VEL_MANUAL": min(mpc_xy, max(v, 8.0)),
         "MPC_Z_VEL_MAX_DN": mpc_z_dn,
         "MPC_Z_VEL_MAX_UP": mpc_z_up,
     }
@@ -514,9 +520,14 @@ except Exception:
     HAS_MAVLINK_OFFBOARD = False
 
 # Stałe faz wspólnych dla wszystkich scenariuszy (etykiety do klasyfikacji)
-WARMUP_S = 3.0
-TAKEOFF_WAIT_S = 5.0  # 3 + 5 = 8 s do startu misji
-MISSION_START_OFFSET_S = WARMUP_S + TAKEOFF_WAIT_S  # 8.0 s — od tego momentu zaczyna się "prawdziwa misja"
+# Common phases shared by all scenarios:
+# - warmup: PX4/EKF window while the vehicle is starting
+# - climb: Takeoff wait before the actual scenario begins
+#
+# User request (earlier): warmup 3x krótszy i climb 4x krótszy.
+WARMUP_S = 2.0
+TAKEOFF_WAIT_S = 2.25
+MISSION_START_OFFSET_S = WARMUP_S + TAKEOFF_WAIT_S  # start of the actual scenario
 
 
 def _ensure_output_dir(output_dir: str | None) -> Path:
@@ -982,9 +993,7 @@ def run_single(
     config_multirotor.backends = [PX4MavlinkBackend(mavlink_config)]
 
     # Start na ziemi (jak w przykładzie Pegasus). Wysokość docelowa z parametrów — osiągniemy przez ARM + TAKEOFF.
-    alt_target = params.get("altitude_m", params.get("altitude_start_m", 20.0))
-    if scenario_id == 10:
-        alt_target = 5.0
+    alt_target = float(params.get("altitude_m", params.get("altitude_start_m", 20.0)))
     init_z = 0.07  # nad podłożem, żeby nie kolidować z ziemią
     # Punkt „startu” na ziemi (XY) — musi być zgodny z pierwszym argumentem pozycji Multirotor poniżej.
     # Scenariusz 1: koniec misji, gdy odległość pozioma środka drona od tego punktu >= distance_m (dowolny kierunek).
@@ -1405,6 +1414,95 @@ def run_single(
         try:
             mav_out = MavlinkOffboard("udpout:127.0.0.1:14580")
             if mav_out.bind():
+                mav_out.force_px4_sitl_target()
+                if not mav_out.try_recv_heartbeat():
+                    for _ in range(20):
+                        if mav_out.try_recv_heartbeat():
+                            break
+                mav_out.force_px4_sitl_target()
+
+                # Kluczowe: ustaw limity prędkości PX4 PRZED ARM/takeoff.
+                # Wiele parametrów bywa odrzucanych/ignorowanych po uzbrojeniu.
+                if scenario_id in (1, 2):
+                    _prearm_v_cmd = float(params.get("v_cmd_ms", 10.0) or 10.0)
+                    _prearm_px4_lim = _px4_velocity_mission_limits(params, _prearm_v_cmd)
+                    # Preferuj dwukierunkowy link parametryczny:
+                    # - udpin:14550 (GCS) najczęściej dostaje broadcast PARAM_VALUE
+                    # - potem udpin:14540
+                    # - udpout:14580 zostaw jako ostatni fallback.
+                    _prearm_rb: dict[str, float] = {}
+                    _prearm_keys = ["MPC_XY_VEL_MAX", "MPC_XY_CRUISE", "MPC_VEL_MANUAL"]
+                    _prearm_param_link_used = "udpout:14580"
+                    for _conn_label, _conn_str in [
+                        ("udpin:14550", "udpin:0.0.0.0:14550"),
+                        ("udpin:14540", "udpin:0.0.0.0:14540"),
+                    ]:
+                        if len(_prearm_rb) == len(_prearm_keys):
+                            break
+                        _param_link = None
+                        try:
+                            _param_link = MavlinkOffboard(_conn_str)
+                            if _param_link.bind():
+                                _param_link.force_px4_sitl_target()
+                                _prearm_param_link_used = _conn_label
+                                if not _param_link.try_recv_heartbeat():
+                                    for _ in range(50):
+                                        if _param_link.try_recv_heartbeat():
+                                            break
+                                _param_link.force_px4_sitl_target()
+                                _param_link.set_px4_parameters(_prearm_px4_lim, repeats=12)
+                                for _ in range(5):
+                                    for _k in _prearm_keys:
+                                        if _k in _prearm_rb:
+                                            continue
+                                        _v = _param_link.read_px4_param(_k, timeout_s=1.0)
+                                        if _v is not None:
+                                            _prearm_rb[_k] = _v
+                                    if len(_prearm_rb) == len(_prearm_keys):
+                                        break
+                        except Exception as _e:
+                            carb.log_warn(f"PX4 prearm param link error ({_conn_label}): {_e}")
+                        finally:
+                            if _param_link is not None:
+                                try:
+                                    _param_link.close()
+                                except Exception:
+                                    pass
+
+                    # Fallback: jeżeli udpin nie dał pełnego readbacku, spróbuj na istniejącym linku 14580.
+                    if len(_prearm_rb) < len(_prearm_keys):
+                        mav_out.force_px4_sitl_target()
+                        mav_out.set_px4_parameters(_prearm_px4_lim, repeats=8)
+                        for _ in range(3):
+                            for _k in _prearm_keys:
+                                if _k in _prearm_rb:
+                                    continue
+                                _v = mav_out.read_px4_param(_k, timeout_s=0.8)
+                                if _v is not None:
+                                    _prearm_rb[_k] = _v
+                            if len(_prearm_rb) == len(_prearm_keys):
+                                break
+
+                    _prearm_xy_rb = _prearm_rb.get("MPC_XY_VEL_MAX")
+                    # Ważne diagnostycznie: warning, aby było widoczne nawet przy filtrowaniu INFO.
+                    carb.log_warn(
+                        "PX4 prearm velocity readback: "
+                        f"MPC_XY_VEL_MAX={_prearm_rb.get('MPC_XY_VEL_MAX', None)} "
+                        f"(set={_prearm_px4_lim['MPC_XY_VEL_MAX']:.1f}), "
+                        f"MPC_XY_CRUISE={_prearm_rb.get('MPC_XY_CRUISE', None)} "
+                        f"(set={_prearm_px4_lim['MPC_XY_CRUISE']:.1f}), "
+                        f"MPC_VEL_MANUAL={_prearm_rb.get('MPC_VEL_MANUAL', None)} "
+                        f"(set={_prearm_px4_lim['MPC_VEL_MANUAL']:.1f}), link={_prearm_param_link_used}, "
+                        f"v_cmd={_prearm_v_cmd:.1f}."
+                    )
+                    flight_timeline.mark_once(
+                        "px4_mpc_xy_vel_max_prearm_readback",
+                        step,
+                        mpc_xy_vel_max_prearm_set=_prearm_px4_lim["MPC_XY_VEL_MAX"],
+                        mpc_xy_vel_max_prearm_readback=_prearm_xy_rb,
+                        v_command_ms=_prearm_v_cmd,
+                    )
+
                 mav_out.set_mode_takeoff_px4()
                 flight_timeline.mark_once("px4_auto_takeoff_mode_command_sent", step)
                 for _ in range(int(0.5 / physics_dt)):
@@ -1441,10 +1539,6 @@ def run_single(
             step += 1
             if spawn_goal_reached:
                 break
-            if vehicle is not None and vehicle._state is not None:
-                if vehicle.state.position[2] >= alt_target - 1.5:
-                    takeoff_end_reason = "altitude_near_target_gate"
-                    break
         flight_timeline.mark_once(
             "takeoff_climb_phase_end",
             step,
@@ -1507,9 +1601,36 @@ def run_single(
         try:
             mav_mission = MavlinkOffboard("udpout:127.0.0.1:14580")
             if mav_mission.bind():
+                mav_mission.force_px4_sitl_target()
+                # Upewnij się, że mamy poprawne target_system/target_component z HEARTBEAT.
+                # Bez tego PARAM_SET może nie trafić w PX4 (stąd np. brak zmiany limitów i efekt ~12 m/s).
+                if not mav_mission.try_recv_heartbeat():
+                    for _ in range(20):
+                        if mav_mission.try_recv_heartbeat():
+                            break
+                mav_mission.force_px4_sitl_target()
                 # PX4: MPC_XY_VEL_MAX itd. — bez tego OFFBOARD jest obcinany (wcześniej sztywne 20 m/s).
                 _px4_lim = _px4_velocity_mission_limits(params, float(v_cmd))
                 mav_mission.set_px4_parameters(_px4_lim, repeats=3)
+                # Readback: sprawdź czy PX4 faktycznie przyjął MPC_XY_VEL_MAX.
+                _mpc_xy_after = mav_mission.read_px4_param("MPC_XY_VEL_MAX", timeout_s=0.3)
+                carb.log_info(
+                    f"Scenariusz 1: readback PX4 MPC_XY_VEL_MAX={_mpc_xy_after if _mpc_xy_after is not None else 'None'} m/s (ustawiane={_px4_lim['MPC_XY_VEL_MAX']:.1f})."
+                )
+                flight_timeline.mark_once(
+                    "px4_mpc_xy_vel_max_readback",
+                    step,
+                    mpc_xy_vel_max_readback=_mpc_xy_after,
+                    mpc_xy_vel_max_set=_px4_lim["MPC_XY_VEL_MAX"],
+                )
+                if (
+                    _mpc_xy_after is not None
+                    and _mpc_xy_after < _px4_lim["MPC_XY_VEL_MAX"] * 0.9
+                ):
+                    carb.log_warn(
+                        "Scenariusz 1: MPC_XY_VEL_MAX nie zmienił się jak oczekiwano — ponawiam PARAM_SET."
+                    )
+                    mav_mission.set_px4_parameters(_px4_lim, repeats=8)
                 mav_mission.set_mode_offboard()
                 carb.log_info(
                     f"Scenariusz 1: OFFBOARD, lot prosto v={float(v_cmd):.1f} m/s, yaw={yaw_deg:.0f}°, "
@@ -1716,16 +1837,58 @@ def run_single(
             s2_acc_peak_step: int | None = None
             s2_acc_prev_v_xy: float | None = None
             s2_acc_prev_t_sim: float | None = None
+            # Real (measured) vmax estimate while accelerating (GT).
+            s2_vxy_peak_real: float | None = None
+            s2_vxy_peak_real_last_update_s: float | None = None
             s2_near_v_reached = False
+
+            # Start threshold for acceleration phase.
             s2_acc_start_v_thresh = 0.6
-            s2_acc_near_v_frac = 0.90
+            # End-of-acceleration criteria:
+            # 1) v_xy within +/-6% of the measured peak
+            s2_acc_vmax_tol_frac = 0.06
+            # 2) peak must stay stable (no meaningful increase) for a bit
+            s2_acc_vmax_stable_s = 0.25
+            # How much a new peak must beat the current one (avoid noise spikes).
+            s2_acc_vxy_peak_update_abs_eps = 0.05
+            # Keep derivative tracking for vx/vy deltas (not just |v_xy|).
+            s2_acc_prev_vx_xy_ms: float | None = None
+            s2_acc_prev_vy_xy_ms: float | None = None
+            # How long we've already stayed within +/- tolerance (for "stable plateau" labeling).
+            s2_acc_vxy_tol_ok_since_s: float | None = None
 
             try:
                 mav_mission = MavlinkOffboard("udpout:127.0.0.1:14580")
                 if mav_mission.bind():
+                    mav_mission.force_px4_sitl_target()
+                    # Upewnij się, że mamy poprawne target_system/target_component z HEARTBEAT.
+                    if not mav_mission.try_recv_heartbeat():
+                        for _ in range(20):
+                            if mav_mission.try_recv_heartbeat():
+                                break
+                    mav_mission.force_px4_sitl_target()
                     # PX4: MPC_XY_VEL_MAX — sufitem na prędkość poziomą (must-have v_cmd 4–30 m/s).
                     _px4_lim = _px4_velocity_mission_limits(params, float(v_cmd))
                     mav_mission.set_px4_parameters(_px4_lim, repeats=3)
+                    # Readback: sprawdź czy PX4 faktycznie przyjął MPC_XY_VEL_MAX.
+                    _mpc_xy_after = mav_mission.read_px4_param("MPC_XY_VEL_MAX", timeout_s=0.3)
+                    carb.log_info(
+                        f"Scenariusz 2: readback PX4 MPC_XY_VEL_MAX={_mpc_xy_after if _mpc_xy_after is not None else 'None'} m/s (ustawiane={_px4_lim['MPC_XY_VEL_MAX']:.1f})."
+                    )
+                    flight_timeline.mark_once(
+                        "px4_mpc_xy_vel_max_readback",
+                        step,
+                        mpc_xy_vel_max_readback=_mpc_xy_after,
+                        mpc_xy_vel_max_set=_px4_lim["MPC_XY_VEL_MAX"],
+                    )
+                    if (
+                        _mpc_xy_after is not None
+                        and _mpc_xy_after < _px4_lim["MPC_XY_VEL_MAX"] * 0.9
+                    ):
+                        carb.log_warn(
+                            "Scenariusz 2: MPC_XY_VEL_MAX nie zmienił się jak oczekiwano — ponawiam PARAM_SET."
+                        )
+                        mav_mission.set_px4_parameters(_px4_lim, repeats=8)
                     mav_mission.set_mode_offboard()
                     carb.log_info(
                         f"Scenariusz 2: OFFBOARD cruise v={v_cmd:.1f} m/s, wysokość PD→{_alt_ref:.1f} m (z↑), "
@@ -1799,6 +1962,8 @@ def run_single(
                                     if vehicle is not None and getattr(vehicle, "state", None) is not None:
                                         lv2 = vehicle.state.linear_velocity
                                         vh2 = math.hypot(float(lv2[0]), float(lv2[1]))
+                                        vx2 = float(lv2[0])
+                                        vy2 = float(lv2[1])
 
                                         # --- Acceleration phase recognition (cruise start) ---
                                         if not s2_acc_started and vh2 >= s2_acc_start_v_thresh:
@@ -1807,6 +1972,11 @@ def run_single(
                                             # Initialize derivative tracking right at the moment it starts.
                                             s2_acc_prev_v_xy = vh2
                                             s2_acc_prev_t_sim = mission_time_s
+                                            s2_acc_prev_vx_xy_ms = vx2
+                                            s2_acc_prev_vy_xy_ms = vy2
+                                            # Initialize measured vmax with the current value.
+                                            s2_vxy_peak_real = vh2
+                                            s2_vxy_peak_real_last_update_s = mission_time_s
                                             flight_timeline.mark_once(
                                                 "acceleration_phase_started",
                                                 step,
@@ -1821,6 +1991,11 @@ def run_single(
                                                 if dt > 1e-4:
                                                     dv = vh2 - float(s2_acc_prev_v_xy)
                                                     accel_xy = dv / dt
+                                                    # Component-wise deltas: helps to attribute the measured "acceleration" to vx/vy.
+                                                    dvx = vx2 - float(s2_acc_prev_vx_xy_ms) if s2_acc_prev_vx_xy_ms is not None else 0.0
+                                                    dvy = vy2 - float(s2_acc_prev_vy_xy_ms) if s2_acc_prev_vy_xy_ms is not None else 0.0
+                                                    accel_x = dvx / dt
+                                                    accel_y = dvy / dt
                                                     if (
                                                         s2_acc_peak_accel_xy_m_s2 is None
                                                         or accel_xy > float(s2_acc_peak_accel_xy_m_s2)
@@ -1830,40 +2005,70 @@ def run_single(
                                                         s2_acc_peak_v_before = float(s2_acc_prev_v_xy)
                                                         s2_acc_peak_v_after = vh2
                                                         s2_acc_peak_step = step
-                                                        flight_timeline.mark(
-                                                            "acceleration_peak_updated",
-                                                            step,
-                                                            accel_xy_m_s2=accel_xy,
-                                                            dv_m_s=dv,
-                                                            v_xy_before_m_s=float(s2_acc_peak_v_before)
-                                                            if s2_acc_peak_v_before is not None
-                                                            else None,
-                                                            v_xy_after_m_s=float(s2_acc_peak_v_after)
-                                                            if s2_acc_peak_v_after is not None
-                                                            else None,
-                                                        )
+                                                        # Znacznik dla „peak” nie jest potrzebny do stabilnego
+                                                        # etykietowania końca przyspieszenia (wystarczy start + near_vmax).
+
+                                            # Update measured vmax peak while accelerating.
+                                            if s2_vxy_peak_real is None:
+                                                s2_vxy_peak_real = vh2
+                                                s2_vxy_peak_real_last_update_s = mission_time_s
+                                            elif vh2 > float(s2_vxy_peak_real) + s2_acc_vxy_peak_update_abs_eps:
+                                                s2_vxy_peak_real = vh2
+                                                s2_vxy_peak_real_last_update_s = mission_time_s
 
                                             s2_acc_prev_v_xy = vh2
                                             s2_acc_prev_t_sim = mission_time_s
+                                            s2_acc_prev_vx_xy_ms = vx2
+                                            s2_acc_prev_vy_xy_ms = vy2
 
-                                        if (not s2_near_v_reached) and vh2 >= float(v_cmd) * s2_acc_near_v_frac:
-                                            s2_near_v_reached = True
-                                            dv_from_start = None
-                                            if s2_acc_start_v_xy_ms is not None:
-                                                dv_from_start = vh2 - s2_acc_start_v_xy_ms
-                                            flight_timeline.mark_once(
-                                                "acceleration_near_vmax_reached",
-                                                step,
-                                                v_xy_near_vmax_m_s=vh2,
-                                                v_cmd_ms=float(v_cmd),
-                                                dv_from_acc_start_m_s=dv_from_start,
-                                                peak_accel_xy_m_s2=float(s2_acc_peak_accel_xy_m_s2)
-                                                if s2_acc_peak_accel_xy_m_s2 is not None
-                                                else None,
-                                                peak_dv_m_s=float(s2_acc_peak_dv_m_s)
-                                                if s2_acc_peak_dv_m_s is not None
-                                                else None,
-                                            )
+                                        # End-of-acceleration: reached measured vmax plateau
+                                        if not s2_near_v_reached and s2_vxy_peak_real is not None:
+                                            vmax_real = float(s2_vxy_peak_real)
+                                            if vmax_real > 1e-6:
+                                                rel_err = abs(vh2 - vmax_real) / vmax_real
+                                                last_peak_update = (
+                                                    float(s2_vxy_peak_real_last_update_s)
+                                                    if s2_vxy_peak_real_last_update_s is not None
+                                                    else mission_time_s
+                                                )
+                                                stable_for_s = mission_time_s - last_peak_update
+                                                if rel_err <= s2_acc_vmax_tol_frac:
+                                                    if s2_acc_vxy_tol_ok_since_s is None:
+                                                        s2_acc_vxy_tol_ok_since_s = mission_time_s
+                                                else:
+                                                    # We left the +/- tolerance band -> reset.
+                                                    s2_acc_vxy_tol_ok_since_s = None
+
+                                                tol_hold_s = (
+                                                    mission_time_s - s2_acc_vxy_tol_ok_since_s
+                                                    if s2_acc_vxy_tol_ok_since_s is not None
+                                                    else 0.0
+                                                )
+                                                if (
+                                                    tol_hold_s >= s2_acc_vmax_stable_s
+                                                    and stable_for_s >= s2_acc_vmax_stable_s
+                                                ):
+                                                    s2_near_v_reached = True
+                                                    dv_from_start = None
+                                                    if s2_acc_start_v_xy_ms is not None:
+                                                        dv_from_start = vh2 - s2_acc_start_v_xy_ms
+                                                    flight_timeline.mark_once(
+                                                        "acceleration_near_vmax_reached",
+                                                        step,
+                                                        v_xy_near_vmax_m_s=vh2,
+                                                        v_cmd_ms=float(v_cmd),
+                                                        v_max_real_m_s=vmax_real,
+                                                        rel_err_to_vmax_real=rel_err,
+                                                        stable_since_vmax_real_s=stable_for_s,
+                                                        tol_hold_s=tol_hold_s,
+                                                        dv_from_acc_start_m_s=dv_from_start,
+                                                        peak_accel_xy_m_s2=float(s2_acc_peak_accel_xy_m_s2)
+                                                        if s2_acc_peak_accel_xy_m_s2 is not None
+                                                        else None,
+                                                        peak_dv_m_s=float(s2_acc_peak_dv_m_s)
+                                                        if s2_acc_peak_dv_m_s is not None
+                                                        else None,
+                                                    )
 
                                         if vh2 >= float(v_cmd) * _s2_v_frac:
                                             if s2_cruise_fast_since is None:

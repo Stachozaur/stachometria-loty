@@ -16,7 +16,7 @@ from typing import Any
 
 PHASE_LABELS_DOC = (
     "phase_times: wektor faz z przedziałami [t_start_s, t_end_s] i klasą fazy. "
-    "W każdym runie na początku są fazy wspólne: rozgrzewka (0–3 s), wznoszenie (3–8 s); od 8 s zaczyna się misja (fazy scenariusza). "
+    "W każdym runie na początku są fazy wspólne: rozgrzewka (0–1 s), wznoszenie (1–2.25 s); od 2.25 s zaczyna się misja (fazy scenariusza). "
     "Etykiety do klasyfikacji: rozgrzewka, wznoszenie, hamowanie, przyspieszanie, zawis, lot_prosty, zakręt, wiatr_step, start, podejście, itd. "
     "Zgodnie z sekcją 'Etykiety faz z definicji scenariusza (samoetykietowanie)' w docs/py/scenarios.md."
 )
