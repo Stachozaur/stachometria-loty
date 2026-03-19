@@ -120,6 +120,52 @@ def _wind_force_legacy_ned(w_ned: tuple[float, float, float], k_wind: float) -> 
     return (s * wn / h, s * we / h, 0.0)
 
 
+def _px4_velocity_mission_limits(params: dict[str, Any], v_cmd_ms: float) -> dict[str, float]:
+    """
+    Limity prędkości PX4 (PARAM_SET) przed lotem OFFBOARD.
+
+    **Skąd „blokada” ~12–20 m/s:** autopilot stosuje m.in. **MPC_XY_VEL_MAX** jako sufit na |v_xy|.
+    Stałe 20 m/s w kodzie obcinały setpoint przy ``v_cmd_ms`` do 30 m/s — w CSV (GT) widać było
+    niższą prędkość mimo większego MAVLinka. To nie jest limit Pegasus/Isaac z tego skryptu,
+    tylko **parametr PX4** (do „ominiecia” trzeba go podnieść, nie ma magicznego bypassu).
+
+    Opcjonalne klucze w ``params`` / JSON runu:
+      - ``px4_mpc_xy_vel_max`` — jawny sufit XY (m/s)
+      - ``px4_mpc_z_vel_max_dn`` / ``px4_mpc_z_vel_max_up`` — Z NED (m/s)
+      - ``px4_mpc_acc_hor`` → **MPC_ACC_HOR** (m/s²), tylko jeśli ustawione — szybsze dochodzenie do dużego v_cmd
+    """
+    v = max(0.1, float(v_cmd_ms))
+    xy_raw = params.get("px4_mpc_xy_vel_max")
+    if xy_raw is None:
+        # Zapas na śledzenie setpointu + wiatr; must-have: v_cmd do 30 m/s
+        mpc_xy = max(v + 10.0, 15.0)
+    else:
+        mpc_xy = float(xy_raw)
+    mpc_xy = max(mpc_xy, v + 2.0)
+
+    zdn_raw = params.get("px4_mpc_z_vel_max_dn")
+    if zdn_raw is None:
+        mpc_z_dn = max(5.0, 4.0 + 0.12 * min(v, 30.0))
+    else:
+        mpc_z_dn = float(zdn_raw)
+
+    zup_raw = params.get("px4_mpc_z_vel_max_up")
+    if zup_raw is None:
+        mpc_z_up = max(6.0, 5.0 + 0.12 * min(v, 30.0))
+    else:
+        mpc_z_up = float(zup_raw)
+
+    out: dict[str, float] = {
+        "MPC_XY_VEL_MAX": mpc_xy,
+        "MPC_Z_VEL_MAX_DN": mpc_z_dn,
+        "MPC_Z_VEL_MAX_UP": mpc_z_up,
+    }
+    acc_raw = params.get("px4_mpc_acc_hor")
+    if acc_raw is not None:
+        out["MPC_ACC_HOR"] = float(acc_raw)
+    return out
+
+
 def _meteo_wind_from_deg(wn: float, we: float) -> float:
     """Kierunek meteo „z którego wieje” [°], 0=N, 90=E — z wektora prędkości powietrza w NED (poziomo)."""
     if abs(wn) < 1e-9 and abs(we) < 1e-9:
@@ -1461,18 +1507,15 @@ def run_single(
         try:
             mav_mission = MavlinkOffboard("udpout:127.0.0.1:14580")
             if mav_mission.bind():
-                # Podniesienie limitów prędkości PX4 — inaczej OFFBOARD velocity bywa obcięty
-                # (w logach zwykle wychodzi ~12 m/s mimo większego v_cmd_ms).
-                mav_mission.set_px4_parameters(
-                    {
-                        "MPC_XY_VEL_MAX": 20.0,
-                        "MPC_Z_VEL_MAX_DN": 4.0,
-                        "MPC_Z_VEL_MAX_UP": 5.0,
-                    },
-                    repeats=3,
-                )
+                # PX4: MPC_XY_VEL_MAX itd. — bez tego OFFBOARD jest obcinany (wcześniej sztywne 20 m/s).
+                _px4_lim = _px4_velocity_mission_limits(params, float(v_cmd))
+                mav_mission.set_px4_parameters(_px4_lim, repeats=3)
                 mav_mission.set_mode_offboard()
-                carb.log_info(f"Scenariusz 1: OFFBOARD, lot prosto v={v_cmd:.1f} m/s, yaw={yaw_deg:.0f}°, max {distance_m:.0f} m lub {mission_duration_s:.0f} s")
+                carb.log_info(
+                    f"Scenariusz 1: OFFBOARD, lot prosto v={float(v_cmd):.1f} m/s, yaw={yaw_deg:.0f}°, "
+                    f"max {distance_m:.0f} m lub {mission_duration_s:.0f} s; "
+                    f"PX4 MPC_XY_VEL_MAX={_px4_lim['MPC_XY_VEL_MAX']:.1f} m/s (sufit na |v_xy|)."
+                )
                 mission_time_s = 0.0
                 s1_first_cmd = True
                 s1_cruise_fast_since: float | None = None
@@ -1680,20 +1723,14 @@ def run_single(
             try:
                 mav_mission = MavlinkOffboard("udpout:127.0.0.1:14580")
                 if mav_mission.bind():
-                    # Podniesienie limitów prędkości PX4 — bez tego OFFBOARD velocity bywa obcięty
-                    # i w GT wychodzi ~12 m/s niezależnie od v_cmd_ms.
-                    mav_mission.set_px4_parameters(
-                        {
-                            "MPC_XY_VEL_MAX": 20.0,
-                            "MPC_Z_VEL_MAX_DN": 4.0,
-                            "MPC_Z_VEL_MAX_UP": 5.0,
-                        },
-                        repeats=3,
-                    )
+                    # PX4: MPC_XY_VEL_MAX — sufitem na prędkość poziomą (must-have v_cmd 4–30 m/s).
+                    _px4_lim = _px4_velocity_mission_limits(params, float(v_cmd))
+                    mav_mission.set_px4_parameters(_px4_lim, repeats=3)
                     mav_mission.set_mode_offboard()
                     carb.log_info(
                         f"Scenariusz 2: OFFBOARD cruise v={v_cmd:.1f} m/s, wysokość PD→{_alt_ref:.1f} m (z↑), "
-                        f"wobble celu ≤{_wobble_frac*100:.1f} %; koniec cruise przy ≥{distance_m:.0f} m od spawnu."
+                        f"wobble celu ≤{_wobble_frac*100:.1f} %; koniec cruise przy ≥{distance_m:.0f} m od spawnu; "
+                        f"PX4 MPC_XY_VEL_MAX={_px4_lim['MPC_XY_VEL_MAX']:.1f} m/s."
                     )
                     for _ in range(steps_total):
                         if not simulation_app.is_running():
@@ -2035,7 +2072,9 @@ def run_single(
             "commanded_cruise_speed_ms": float(params.get("v_cmd_ms", 0.0) or 0.0),
             "speed_measurement_note": (
                 "v_horizontal_ground_truth_ms is from Pegasus/Isaac linear_velocity XY (NED). "
-                "It is often below v_cmd_ms: PX4 OFFBOARD does not instantly match horizontal setpoint; wind and climb matter."
+                "PX4 MPC_XY_VEL_MAX is raised from params/v_cmd before flight so OFFBOARD is not clamped to ~12–20 m/s; "
+                "measured speed can still lag v_cmd_ms (tracking, wind, altitude loop). "
+                "Override: px4_mpc_xy_vel_max, px4_mpc_z_vel_max_dn/up, px4_mpc_acc_hor in run params JSON."
             ),
         }
         _save_flight_timeline_json(
