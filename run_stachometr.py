@@ -1517,6 +1517,12 @@ def run_single(
         _apply_wind_force()
         world.step(render=not _HEADLESS)
 
+    def _pump_step():
+        """Headless: jeden world.step(render=False) żeby PX4 dostał HIL_SENSOR i nie wypadł z lockstepu.
+        Używany w fazach pre-arm (heartbeat wait, param set/read) gdzie normalnie nie ma world.step()."""
+        if _HEADLESS:
+            world.step(render=False)
+
     def _maybe_mark_spawn_goal_done() -> None:
         """Scenariusz 1: jeśli promień poziomy od spawn_xy ≥ distance_m — kończymy cały run (także w rozgrzewce / wznoszeniu)."""
         nonlocal spawn_goal_reached
@@ -1724,9 +1730,12 @@ def run_single(
             if mav_out.bind():
                 mav_out.force_px4_sitl_target()
                 if not mav_out.try_recv_heartbeat():
-                    for _ in range(20):
+                    # Headless: po każdej próbie pompuj physics step — PX4 musi dostać HIL_SENSOR
+                    # żeby móc wysłać heartbeat (lockstep). Bez pump PX4 jest zamrożony.
+                    for _ in range(200):
                         if mav_out.try_recv_heartbeat():
                             break
+                        _pump_step()
                 mav_out.force_px4_sitl_target()
 
                 # Kluczowe: ustaw limity prędkości PX4 PRZED ARM/takeoff.
@@ -1761,18 +1770,23 @@ def run_single(
                                 _param_link.force_px4_sitl_target()
                                 _prearm_param_link_used = _conn_label
                                 if not _param_link.try_recv_heartbeat():
-                                    for _ in range(50):
+                                    # Headless: pompuj physics steps między próbami heartbeat
+                                    for _ in range(200):
                                         if _param_link.try_recv_heartbeat():
                                             break
+                                        _pump_step()
                                 _param_link.force_px4_sitl_target()
-                                _param_link.set_px4_parameters(_prearm_px4_lim, repeats=12)
+                                # Headless: step_fn zamiast time.sleep(0.02) — utrzymuje lockstep PX4
+                                _param_link.set_px4_parameters(_prearm_px4_lim, repeats=12, step_fn=_pump_step)
                                 for _ in range(5):
                                     for _k in _prearm_keys:
                                         if _k in _prearm_rb:
                                             continue
-                                        _v = _param_link.read_px4_param(_k, timeout_s=1.0)
+                                        # Headless: step_fn pompuje physics podczas czekania na PARAM_VALUE
+                                        _v = _param_link.read_px4_param(_k, timeout_s=1.0, step_fn=_pump_step)
                                         if _v is not None:
                                             _prearm_rb[_k] = _v
+                                    _pump_step()  # po każdej rundzie weryfikacji
                                     if len(_prearm_rb) == len(_prearm_keys):
                                         break
                         except Exception as _e:
@@ -1920,15 +1934,16 @@ def run_single(
                 # Upewnij się, że mamy poprawne target_system/target_component z HEARTBEAT.
                 # Bez tego PARAM_SET może nie trafić w PX4 (stąd np. brak zmiany limitów i efekt ~12 m/s).
                 if not mav_mission.try_recv_heartbeat():
-                    for _ in range(20):
+                    for _ in range(200):
                         if mav_mission.try_recv_heartbeat():
                             break
+                        _pump_step()
                 mav_mission.force_px4_sitl_target()
                 # PX4: MPC_XY_VEL_MAX itd. — bez tego OFFBOARD jest obcinany (wcześniej sztywne 20 m/s).
                 _px4_lim = _px4_velocity_mission_limits(params, float(v_cmd))
-                mav_mission.set_px4_parameters(_px4_lim, repeats=3)
+                mav_mission.set_px4_parameters(_px4_lim, repeats=3, step_fn=_pump_step)
                 # Readback: sprawdź czy PX4 faktycznie przyjął MPC_XY_VEL_MAX.
-                _mpc_xy_after = mav_mission.read_px4_param("MPC_XY_VEL_MAX", timeout_s=0.3)
+                _mpc_xy_after = mav_mission.read_px4_param("MPC_XY_VEL_MAX", timeout_s=0.3, step_fn=_pump_step)
                 carb.log_info(
                     f"Scenariusz 1: readback PX4 MPC_XY_VEL_MAX={_mpc_xy_after if _mpc_xy_after is not None else 'None'} m/s (ustawiane={_px4_lim['MPC_XY_VEL_MAX']:.1f})."
                 )
@@ -1974,7 +1989,7 @@ def run_single(
                         break
                     vz_sp = _mission_vz_altitude_wave(mission_time_s)
                     last_setpoint[0], last_setpoint[1], last_setpoint[2] = vx, vy, vz_sp
-                    time_boot_ms = int(step * physics_dt * 1000)
+                    time_boot_ms = int(world.current_time * 1000)
                     if s1_first_cmd:
                         flight_timeline.mark_once(
                             "offboard_velocity_stream_started",
@@ -2162,15 +2177,16 @@ def run_single(
                     mav_mission.force_px4_sitl_target()
                     # Upewnij się, że mamy poprawne target_system/target_component z HEARTBEAT.
                     if not mav_mission.try_recv_heartbeat():
-                        for _ in range(20):
+                        for _ in range(200):
                             if mav_mission.try_recv_heartbeat():
                                 break
+                            _pump_step()
                     mav_mission.force_px4_sitl_target()
                     # PX4: MPC_XY_VEL_MAX — sufitem na prędkość poziomą (must-have v_cmd 4–30 m/s).
                     _px4_lim = _px4_velocity_mission_limits(params, float(v_cmd))
-                    mav_mission.set_px4_parameters(_px4_lim, repeats=3)
+                    mav_mission.set_px4_parameters(_px4_lim, repeats=3, step_fn=_pump_step)
                     # Readback: sprawdź czy PX4 faktycznie przyjął MPC_XY_VEL_MAX.
-                    _mpc_xy_after = mav_mission.read_px4_param("MPC_XY_VEL_MAX", timeout_s=0.3)
+                    _mpc_xy_after = mav_mission.read_px4_param("MPC_XY_VEL_MAX", timeout_s=0.3, step_fn=_pump_step)
                     carb.log_info(
                         f"Scenariusz 2: readback PX4 MPC_XY_VEL_MAX={_mpc_xy_after if _mpc_xy_after is not None else 'None'} m/s (ustawiane={_px4_lim['MPC_XY_VEL_MAX']:.1f})."
                     )
@@ -2198,7 +2214,7 @@ def run_single(
                         if not simulation_app.is_running():
                             break
                         mission_time_s = float(getattr(world, "current_time", 0.0) or 0.0) - mission_t0_sim
-                        time_boot_ms = int(step * physics_dt * 1000)
+                        time_boot_ms = int(world.current_time * 1000)
 
                         if not land_commanded:
                             if phase == "cruise":
@@ -2591,9 +2607,10 @@ def run_single(
             if mav3.bind():
                 mav3.force_px4_sitl_target()
                 if not mav3.try_recv_heartbeat():
-                    for _ in range(20):
+                    for _ in range(200):
                         if mav3.try_recv_heartbeat():
                             break
+                        _pump_step()
                 mav3.force_px4_sitl_target()
                 mav3.set_mode_offboard()
                 mission_time_s = 0.0
@@ -2657,7 +2674,7 @@ def run_single(
                                 vx = v * math.cos(heading)
                                 vy = v * math.sin(heading)
                                 last_setpoint[:] = [vx, vy, vz]
-                                mav3.send_velocity_target_ned(int(step * physics_dt * 1000), vx, vy, vz)
+                                mav3.send_velocity_target_ned(int(world.current_time * 1000), vx, vy, vz)
                                 _do_step()
                                 log_state(step)
                                 _update_follow_camera(vehicle, heading, current_seg_label[0])
@@ -2678,7 +2695,7 @@ def run_single(
                             vx = v * math.cos(heading)
                             vy = v * math.sin(heading)
                             last_setpoint[:] = [vx, vy, vz]
-                            mav3.send_velocity_target_ned(int(step * physics_dt * 1000), vx, vy, vz)
+                            mav3.send_velocity_target_ned(int(world.current_time * 1000), vx, vy, vz)
                             _do_step()
                             log_state(step)
                             _update_follow_camera(vehicle, heading, current_seg_label[0])
@@ -2709,7 +2726,7 @@ def run_single(
                         break
                     vz = _get_vz(vehicle, brake_z_hold, bz_kp, bz_kd, bz_cap) if brake_z_hold else 0.0
                     last_setpoint[:] = [0.0, 0.0, vz]
-                    mav3.send_velocity_target_ned(int(step * physics_dt * 1000), 0.0, 0.0, vz)
+                    mav3.send_velocity_target_ned(int(world.current_time * 1000), 0.0, 0.0, vz)
                     _do_step()
                     log_state(step)
                     _update_follow_camera(vehicle, heading, current_seg_label[0])

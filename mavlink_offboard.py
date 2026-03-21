@@ -264,13 +264,16 @@ class MavlinkOffboard:
             type_mask=vel_only_mask,
         )
 
-    def set_px4_parameters(self, params: dict[str, float], repeats: int = 3) -> bool:
-        """
+    def set_px4_parameters(self, params: dict[str, float], repeats: int = 3, step_fn=None) -> bool:
+        “””
         Ustawia parametry PX4 przez MAVLink PARAM_SET.
 
         Uwaga: PX4 może być „wrażliwe” na zmiany parametrów w trakcie lotu/trybów,
         dlatego domyślnie wysyłamy je kilka razy.
-        """
+
+        step_fn: opcjonalny callable() wywoływany po każdej rundzie zamiast time.sleep(0.02).
+                 W trybie headless przekazuj world.step() żeby utrzymać lockstep PX4 żywym.
+        “””
         if self._conn is None:
             return False
 
@@ -295,16 +298,22 @@ class MavlinkOffboard:
                     )
                 except Exception:
                     ok = False
-            time.sleep(0.02)
+            if step_fn is not None:
+                step_fn()
+            else:
+                time.sleep(0.02)
         return ok
 
-    def read_px4_param(self, param_id: str, timeout_s: float = 1.0) -> Optional[float]:
+    def read_px4_param(self, param_id: str, timeout_s: float = 1.0, step_fn=None) -> Optional[float]:
         """
         Odczytuje pojedynczy parametr PX4 przez MAVLink PARAM_REQUEST_READ.
 
         PX4 SITL offboard port (14580) wysyła odpowiedzi (PARAM_VALUE) na stały adres
         zdefiniowany przez -o w px4-rc.mavlink (domyślnie 14540), nie z powrotem do nadawcy.
         Dlatego nasłuchujemy na dodatkowym gnieździe udpin:0.0.0.0:14540.
+
+        step_fn: opcjonalny callable() wywoływany po każdym nieudanym recv (0.1s timeout).
+                 W trybie headless przekazuj world.step() żeby utrzymać lockstep PX4 żywym.
 
         Zwraca float (param_value) lub None, jeśli timeout / brak odpowiedzi.
         """
@@ -347,6 +356,9 @@ class MavlinkOffboard:
                 except Exception:
                     msg = None
                 if msg is None:
+                    # Każde niepowodzenie odbioru: pompuj physics step żeby PX4 nie stracił lockstepu.
+                    if step_fn is not None:
+                        step_fn()
                     continue
                 try:
                     got_id = getattr(msg, "param_id", None)
