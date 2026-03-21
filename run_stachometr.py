@@ -464,7 +464,7 @@ class _LiveDisplay:
                 att = getattr(s, "attitude", None)
                 if att is not None and len(att) >= 4:
                     qx, qy, qz, qw = (float(att[0]), float(att[1]), float(att[2]), float(att[3]))
-                    # Te same wartości co qw,qx,qy,qz w CSV; krótsze etykiety w panelu: kwat_* = kwaternion (w,x,y,z), w = składowa „skalarna”.
+                    # Te same wartości co qw,qx,qy,qz w CSV; krótsze etykiety w panelu: kwat_* = kwaternion (w,x,y,z), w = składowa „skalarna".
                     data["kwat_w"] = f"{qw:.5f}"
                     data["kwat_x"] = f"{qx:.5f}"
                     data["kwat_y"] = f"{qy:.5f}"

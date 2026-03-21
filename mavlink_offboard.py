@@ -265,15 +265,15 @@ class MavlinkOffboard:
         )
 
     def set_px4_parameters(self, params: dict[str, float], repeats: int = 3, step_fn=None) -> bool:
-        “””
+        """
         Ustawia parametry PX4 przez MAVLink PARAM_SET.
 
-        Uwaga: PX4 może być „wrażliwe” na zmiany parametrów w trakcie lotu/trybów,
+        Uwaga: PX4 może być „wrażliwe" na zmiany parametrów w trakcie lotu/trybów,
         dlatego domyślnie wysyłamy je kilka razy.
 
         step_fn: opcjonalny callable() wywoływany po każdej rundzie zamiast time.sleep(0.02).
                  W trybie headless przekazuj world.step() żeby utrzymać lockstep PX4 żywym.
-        “””
+        """
         if self._conn is None:
             return False
 
