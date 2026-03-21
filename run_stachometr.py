@@ -1365,6 +1365,16 @@ def run_single(
     if step_dt <= 0.0:
         step_dt = 1.0 / 60.0
 
+    if _HEADLESS:
+        # W headless, world.step(render=False) przesuwa current_time o physics_dt, NIE o rendering_dt.
+        # Rendering jest wyłączone — "rendering frame" nie istnieje; każdy world.step() = jeden physics tick.
+        # Bez tej korekty warmup/misja/pętle segmentów są za krótkie o czynnik rendering_dt/physics_dt (~4×).
+        step_dt = physics_dt
+        carb.log_info(
+            f"Stachometr [HEADLESS]: step_dt wymuszony na physics_dt={physics_dt:.6f} s "
+            f"(world.step(render=False) przesuwa current_time o physics_dt, nie rendering_dt)"
+        )
+
     carb.log_info(
         f"Stachometr: physics_dt={physics_dt:.6f} s ({1.0/physics_dt:.0f} Hz), "
         f"step_dt={step_dt:.6f} s ({1.0/step_dt:.0f} Hz) — "
