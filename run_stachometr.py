@@ -23,7 +23,7 @@ Użycie:
 
   Scenariusz 2 (lot do celu 500–1000 m + lądowanie PX4 AUTO LAND), z wiatrem:
     ./python.sh stachometr/run_stachometr.py --preview --scenario 2 --seed $RANDOM
-  Większe podłoże / „kratka” w viewport (~2 km bok, domyślnie włączone):
+  Większe podłoże / "kratka" w viewport (~2 km bok, domyślnie włączone):
     # opcjonalnie: --ground-extent-m 0 wyłącza; --ground-extent-m 3000 → 3 km
 
   Dla wszystkich scenariuszy po 50 lotów (batch):
@@ -65,8 +65,8 @@ def _parse_args_before_isaac():
     parser.add_argument(
         "--ground-extent-m",
         type=float,
-        default=2000.0,
-        help="Docelowy bok płaskiego podłoża (m) po przeskalowaniu — większa „kratka”/ziemia na długie loty; 0=wyłącz",
+        default=8000.0,
+        help="Docelowy bok plaskeigo podloza (m) po przeskalowaniu — wieksza 'kratka'/ziemia na dlugie loty; 0=wylacz",
     )
     return parser.parse_known_args()[0]
 
@@ -79,7 +79,38 @@ from isaacsim import SimulationApp
 _HEADLESS = _ARGS_EARLY.headless if _ARGS_EARLY.headless else (not _ARGS_EARLY.preview)
 simulation_app = SimulationApp({"headless": _HEADLESS})
 
+# --- Follow camera + Attitude cam (tylko w trybie GUI) ---
+_HAS_FOLLOW_CAM = False
+_set_camera_view_fn = None
+_np_cam = None
+_attitude_cam_vp = None     # ViewportWindow dla attitude cam (Viewport 2)
+
+# Debug-draw trail — zero USD / zero PhysX (pure viewport overlay)
+_HAS_DEBUG_DRAW = False
+_debug_draw_iface = None
+_trail_deque = None          # collections.deque of (x,y,z) tuples
+
+if not _HEADLESS:
+    try:
+        from isaacsim.core.utils.viewports import set_camera_view as _set_camera_view_fn
+        import numpy as _np_cam
+        _HAS_FOLLOW_CAM = True
+    except Exception:
+        pass
+    try:
+        from isaacsim.util.debug_draw import _debug_draw as _dd_mod
+        _debug_draw_iface = _dd_mod.acquire_debug_draw_interface()
+        _HAS_DEBUG_DRAW = True
+    except Exception:
+        try:
+            import omni.isaac.debug_draw._debug_draw as _dd_mod
+            _debug_draw_iface = _dd_mod.acquire_debug_draw_interface()
+            _HAS_DEBUG_DRAW = True
+        except Exception:
+            pass
+
 # --- Reszta importów po uruchomieniu Sim ---
+import collections
 import json
 import omni.physx
 import omni.timeline
@@ -124,10 +155,10 @@ def _px4_velocity_mission_limits(params: dict[str, Any], v_cmd_ms: float) -> dic
     """
     Limity prędkości PX4 (PARAM_SET) przed lotem OFFBOARD.
 
-    **Skąd „blokada” ~12–20 m/s:** autopilot stosuje m.in. **MPC_XY_VEL_MAX** jako sufit na |v_xy|.
+    **Skąd "blokada" ~12–20 m/s:** autopilot stosuje m.in. **MPC_XY_VEL_MAX** jako sufit na |v_xy|.
     Stałe 20 m/s w kodzie obcinały setpoint przy ``v_cmd_ms`` do 30 m/s — w CSV (GT) widać było
     niższą prędkość mimo większego MAVLinka. To nie jest limit Pegasus/Isaac z tego skryptu,
-    tylko **parametr PX4** (do „ominiecia” trzeba go podnieść, nie ma magicznego bypassu).
+    tylko **parametr PX4** (do "ominiecia" trzeba go podnieść, nie ma magicznego bypassu).
 
     Opcjonalne klucze w ``params`` / JSON runu:
       - ``px4_mpc_xy_vel_max`` — jawny sufit XY (m/s)
@@ -173,7 +204,7 @@ def _px4_velocity_mission_limits(params: dict[str, Any], v_cmd_ms: float) -> dic
 
 
 def _meteo_wind_from_deg(wn: float, we: float) -> float:
-    """Kierunek meteo „z którego wieje” [°], 0=N, 90=E — z wektora prędkości powietrza w NED (poziomo)."""
+    """Kierunek meteo "z którego wieje" [°], 0=N, 90=E — z wektora prędkości powietrza w NED (poziomo)."""
     if abs(wn) < 1e-9 and abs(we) < 1e-9:
         return 0.0
     rad = math.atan2(-we, -wn)
@@ -261,6 +292,17 @@ table.kv-table td.kv-v {
   color: #0f0;
   font-variant-numeric: tabular-nums;
 }
+.aktywny-manewr {
+  background: #1a2200;
+  border: 1px solid #aaff00;
+  border-radius: 3px;
+  padding: 5px 10px;
+  margin-bottom: 10px;
+  font-size: 15px;
+  letter-spacing: 0.03em;
+}
+.manewr-label { color: #888; font-size: 11px; }
+.manewr-val   { color: #aaff00; font-weight: bold; font-size: 15px; }
 </style></head>
 <body>
 <h1>Stachometr — odczyty na żywo</h1>
@@ -286,16 +328,23 @@ function refresh() {
       'param_wind_force_model': 'wind_force_model',
       'wiatr': 'wiatr (run z plikiem *_wind)',
     };
+    let manewrHtml = '';
+    if ('aktywny_manewr' in d) {
+      manewrHtml = '<div class="aktywny-manewr">'
+        + '<span class="manewr-label">MANEWR:</span> '
+        + '<span class="manewr-val">' + d['aktywny_manewr'] + '</span>'
+        + '</div>';
+    }
     const LEFT = [
       { lab: 'Czas i dystans', keys: ['czas_symulacji_s', 'czas_rzeczywisty_s', 'przeleciono_m', 'cel_m'] },
-      { lab: 'Wiatr (symulacja, bieżąco)', keys: ['wiatr_bieżący_m/s', 'wind_vel_n', 'wind_vel_e', 'wiatr_z_którego_°', 'wiatr_podmuch_aktywny', 'wiatr_faza_podmuchu', 'wiatr_podmuch_narasta', 'wiatr_podmuch_z_planu', 'wiatr_zelżenie'] },
+      { lab: 'Wiatr (symulacja, bieżąco)', keys: ['wiatr_bieżący_m/s', 'wiatr_z_którego_°', 'wiatr_podmuch_aktywny'] },
       { lab: 'Prędkość (GT)', keys: ['vel_x', 'vel_y', 'vel_z'] },
       { lab: 'Barometr', keys: ['baro_pressure_hPa', 'baro_temp_C', 'baro_alt_m'] },
       { lab: 'Żyroskop (body)', keys: ['gyro_x', 'gyro_y', 'gyro_z'] },
     ];
     const RIGHT = [
       { lab: 'Pozycja (GT)', keys: ['pos_x', 'pos_y', 'pos_z'] },
-      { lab: 'Orientacja (GT)', keys: ['roll_deg', 'pitch_deg', 'yaw_deg', 'qw', 'qx', 'qy', 'qz'] },
+      { lab: 'Orientacja (GT)', keys: ['roll_deg', 'pitch_deg', 'yaw_deg', 'kwat_w', 'kwat_x', 'kwat_y', 'kwat_z'] },
       { lab: 'Akcelerometr (body)', keys: ['acc_x', 'acc_y', 'acc_z'] },
       { lab: 'Silniki', keys: ['motor_1', 'motor_2', 'motor_3', 'motor_4', 'throttle'] },
     ];
@@ -311,8 +360,9 @@ function refresh() {
       ...LEFT.flatMap(s => s.keys),
       ...RIGHT.flatMap(s => s.keys),
       ...WIND_KEYS,
+      'aktywny_manewr',
     ]);
-    let readingsHtml = '<h2>Odczyty na żywo</h2><div class="readings-2col">';
+    let readingsHtml = '<h2>Odczyty na żywo</h2>' + manewrHtml + '<div class="readings-2col">';
     readingsHtml += '<div class="readings-col">' + renderCols(LEFT) + '</div>';
     readingsHtml += '<div class="readings-col">' + renderCols(RIGHT) + '</div></div>';
     const rest = Object.entries(d).filter(([k]) => !k.startsWith('param_') && !seen.has(k));
@@ -384,6 +434,7 @@ class _LiveDisplay:
         flown_m: float | None = None,
         distance_m_cel: float | None = None,
         wind_snapshot: dict | None = None,
+        current_phase: str | None = None,
     ) -> None:
         if self._server is None:
             return
@@ -391,6 +442,8 @@ class _LiveDisplay:
             "czas_symulacji_s": f"{time_s:.2f}",
             "czas_rzeczywisty_s": f"{time.time() - self._start_wall_s:.2f}",
         }
+        if current_phase:
+            data["aktywny_manewr"] = current_phase
         if flown_m is not None:
             data["przeleciono_m"] = f"{flown_m:.1f}"
             if distance_m_cel is not None:
@@ -411,13 +464,14 @@ class _LiveDisplay:
                 att = getattr(s, "attitude", None)
                 if att is not None and len(att) >= 4:
                     qx, qy, qz, qw = (float(att[0]), float(att[1]), float(att[2]), float(att[3]))
-                    data["qw"] = f"{qw:.5f}"
-                    data["qx"] = f"{qx:.5f}"
-                    data["qy"] = f"{qy:.5f}"
-                    data["qz"] = f"{qz:.5f}"
+                    # Te same wartości co qw,qx,qy,qz w CSV; krótsze etykiety w panelu: kwat_* = kwaternion (w,x,y,z), w = składowa „skalarna”.
+                    data["kwat_w"] = f"{qw:.5f}"
+                    data["kwat_x"] = f"{qx:.5f}"
+                    data["kwat_y"] = f"{qy:.5f}"
+                    data["kwat_z"] = f"{qz:.5f}"
                     try:
                         rot = Rotation.from_quat([qx, qy, qz, qw])
-                        # Euler ZYX [°]: yaw (o Z NED / „heading”), pitch (o Y), roll (o X) — scipy, jednoznacznie z kwaternionu
+                        # Euler ZYX [°]: yaw (o Z NED / "heading"), pitch (o Y), roll (o X) — scipy, jednoznacznie z kwaternionu
                         yaw_deg, pitch_deg, roll_deg = rot.as_euler("ZYX", degrees=True)
                         data["roll_deg"] = f"{roll_deg:.2f}"
                         data["pitch_deg"] = f"{pitch_deg:.2f}"
@@ -443,6 +497,14 @@ class _LiveDisplay:
                         data[f"acc_{ax}"] = f"{acc[i]:.4f}"
                     for i, ax in enumerate("xyz"):
                         data[f"gyro_{ax}"] = f"{gyro[i]:.4f}"
+                if getattr(vehicle, "_sensors", None) and len(vehicle._sensors) > 3:
+                    gps = vehicle._sensors[3].state
+                    glat = gps.get("latitude", "")
+                    glon = gps.get("longitude", "")
+                    galt = gps.get("altitude", "")
+                    data["gps_lat"] = f"{glat:.8f}" if glat != "" and glat is not None else "—"
+                    data["gps_lon"] = f"{glon:.8f}" if glon != "" and glon is not None else "—"
+                    data["gps_alt"] = f"{galt:.2f}" if galt != "" and galt is not None else "—"
             except Exception:
                 pass
             try:
@@ -465,42 +527,24 @@ class _LiveDisplay:
         except Exception:
             pass
         data["wiatr"] = "tak" if self._wind_enabled else "nie"
-        # Bieżący wektor wiatru z PhysX (ten sam co w CSV); kierunek = meteo „z którego wieje”
+        # Bieżący wektor wiatru z PhysX (ten sam co w CSV); kierunek = meteo "z którego wieje"
         if self._wind_enabled and wind_snapshot is not None:
             try:
                 wn = float(wind_snapshot.get("wind_vel_n", 0.0))
                 we = float(wind_snapshot.get("wind_vel_e", 0.0))
                 spd = math.hypot(wn, we)
                 data["wiatr_bieżący_m/s"] = f"{spd:.3f}"
-                data["wind_vel_n"] = f"{wn:.3f}"
-                data["wind_vel_e"] = f"{we:.3f}"
                 data["wiatr_z_którego_°"] = f"{_meteo_wind_from_deg(wn, we):.2f}"
-                gp = wind_snapshot.get("wind_gust_phase", "") or ""
                 ig = int(wind_snapshot.get("wind_is_gust", 0) or 0)
                 data["wiatr_podmuch_aktywny"] = "tak" if ig else "nie"
-                data["wiatr_faza_podmuchu"] = gp if str(gp).strip() else "—"
-                rs = int(wind_snapshot.get("wind_gust_rising", 0) or 0)
-                data["wiatr_podmuch_narasta"] = "tak" if (ig and rs) else ("nie" if ig else "—")
-                fs = int(wind_snapshot.get("wind_gust_from_schedule", 0) or 0)
-                data["wiatr_podmuch_z_planu"] = "tak" if fs else ("nie" if ig else "—")
-                ll = int(wind_snapshot.get("wind_gust_is_lull", 0) or 0)
-                data["wiatr_zelżenie"] = "tak" if ll else ("nie" if ig else "—")
             except Exception:
                 data["wiatr_bieżący_m/s"] = "—"
                 data["wiatr_z_którego_°"] = "—"
                 data["wiatr_podmuch_aktywny"] = "—"
-                data["wiatr_faza_podmuchu"] = "—"
-                data["wiatr_podmuch_narasta"] = "—"
-                data["wiatr_podmuch_z_planu"] = "—"
-                data["wiatr_zelżenie"] = "—"
         else:
             data["wiatr_bieżący_m/s"] = "—"
             data["wiatr_z_którego_°"] = "—"
             data["wiatr_podmuch_aktywny"] = "—"
-            data["wiatr_faza_podmuchu"] = "—"
-            data["wiatr_podmuch_narasta"] = "—"
-            data["wiatr_podmuch_z_planu"] = "—"
-            data["wiatr_zelżenie"] = "—"
         self._state["data"] = {**self._params_display, **data}
 
     def close(self) -> None:
@@ -525,8 +569,8 @@ except Exception:
 # - climb: Takeoff wait before the actual scenario begins
 #
 # User request (earlier): warmup 3x krótszy i climb 4x krótszy.
-WARMUP_S = 2.0
-TAKEOFF_WAIT_S = 2.25
+WARMUP_S = 8.0
+TAKEOFF_WAIT_S = 8.0
 MISSION_START_OFFSET_S = WARMUP_S + TAKEOFF_WAIT_S  # start of the actual scenario
 
 
@@ -832,7 +876,7 @@ def _scale_flat_ground_extent_xy(stage, extent_xy_m: float) -> None:
             sx = float(mx[0] - mn[0])
             sy = float(mx[1] - mn[1])
             sz = float(mx[2] - mn[2])
-            # Płaskie „płyty”; nieco luźniejsze progi (kolizja / kilka meshów)
+            # Płaskie "płyty"; nieco luźniejsze progi (kolizja / kilka meshów)
             if sz > 45.0 or sx < 12.0 or sy < 12.0:
                 continue
             if sx * sy < 2000.0:
@@ -949,6 +993,222 @@ def _add_bright_lighting() -> None:
         carb.log_warn(f"Oświetlenie: {e}")
 
 
+_cam_eye: list = []         # smoothed chase-cam eye   [x, y, z] ENU
+_cam_tgt: list = []         # smoothed chase-cam target [x, y, z] ENU
+_att_cam_eye: list = []     # smoothed attitude-cam eye   [x, y, z] ENU
+_att_cam_tgt: list = []     # smoothed attitude-cam target [x, y, z] ENU
+
+
+
+
+
+
+_TRAIL_MAXLEN = 300          # ~5 s przy 60 Hz
+_TRAIL_LINE_W = 3.0          # szerokość linii w pikselach
+_TRAIL_COLOR  = (1.0, 0.5, 0.05)   # RGB pomarańczowy
+
+
+def _init_trail_draw() -> None:
+    """Inicjalizuje deque; debug_draw_iface jest już gotowy na poziomie modułu."""
+    global _trail_deque
+    if not _HAS_DEBUG_DRAW:
+        return
+    _trail_deque = collections.deque(maxlen=_TRAIL_MAXLEN)
+
+
+def _update_trail(vehicle) -> None:
+    """Dodaje pozycję za dronem do deque i przerysowuje smugę przez debug_draw (zero fizyki)."""
+    if not _HAS_DEBUG_DRAW or _trail_deque is None or _debug_draw_iface is None:
+        return
+    if vehicle is None or not getattr(vehicle, "_state", None):
+        return
+    try:
+        p = vehicle.state.position
+        vel = vehicle.state.linear_velocity
+        px, py, pz = float(p[0]), float(p[1]), float(p[2])
+        vx, vy = float(vel[0]), float(vel[1])
+        spd_h = math.sqrt(vx * vx + vy * vy)
+        if spd_h > 0.3:
+            ox, oy = -vx / spd_h * 0.4, -vy / spd_h * 0.4
+        else:
+            ox, oy = 0.0, 0.0
+        _trail_deque.append((px + ox, py + oy, pz))
+
+        n = len(_trail_deque)
+        if n < 2:
+            return
+
+        pts = list(_trail_deque)
+        starts = pts[:-1]
+        ends   = pts[1:]
+        n_seg  = len(starts)
+        r, g, b = _TRAIL_COLOR
+        colors = [(r, g, b, i / (n_seg - 1)) for i in range(n_seg)]
+        widths = [_TRAIL_LINE_W] * n_seg
+
+        _debug_draw_iface.clear_lines()
+        _debug_draw_iface.draw_lines(starts, ends, colors, widths)
+    except Exception:
+        pass
+
+
+def _clear_trail() -> None:
+    if _HAS_DEBUG_DRAW and _debug_draw_iface is not None:
+        try:
+            _debug_draw_iface.clear_lines()
+        except Exception:
+            pass
+    if _trail_deque is not None:
+        _trail_deque.clear()
+
+
+def _update_follow_camera(vehicle, heading_rad: float, phase_label: str) -> None:
+    """Przesuwa kamerę viewport za dronem co krok symulacji (60 Hz).
+
+    Dwie stałe czasowe:
+    - alpha_tgt = 0.40: target (= pozycja drona) goni bardzo szybko → dron zawsze w centrum kadru
+    - alpha_eye = 0.10: eye (pozycja kamery) goni wolniej → płynny ruch bez teleportów
+
+    Tryby kamer (przełączane przez phase_label):
+    - slalom_*        → kamera boczna  (widać wahnięcia L/P)
+    - zawrot / zakret_gwaltowny → kamera z góry  (widać łuk U-turnu)
+    - hamowanie / ladowanie_px4 → kamera z przodu (dron jedzie w obiektyw)
+    - pozostałe       → chase cam 9 m z tyłu, 5 m z góry
+    """
+    global _cam_eye, _cam_tgt
+    if not _HAS_FOLLOW_CAM or vehicle is None or not getattr(vehicle, "_state", None):
+        return
+    try:
+        p = vehicle.state.position          # ENU: x=North, y=East, z=Up
+        px, py, pz = float(p[0]), float(p[1]), float(p[2])
+        fwd_x = math.cos(heading_rad)
+        fwd_y = math.sin(heading_rad)
+        rgt_x =  math.sin(heading_rad)
+        rgt_y = -math.cos(heading_rad)
+
+        # target zawsze = dron (lekki offset w górę → dron na dolnej 1/3 kadru)
+        tgt_d = [px, py, pz + 0.8]
+
+        _is_topdown = phase_label in (
+            "slalom_lagodny", "slalom_sredni", "slalom_ostry",
+            "zakret_lagodny", "zakret_sredni", "zakret_ostry",
+            "zakret_gwaltowny", "zawrot",
+        )
+        if _is_topdown:
+            # Top-down: prosto z góry, bez heading/rotacji, wolne śledzenie → dron wylatuje z kadru
+            eye_d = [px, py, pz + 50.0]
+            tgt_d = [px, py, pz]
+            alpha_eye = 0.04
+            alpha_tgt = 0.04
+        elif phase_label in ("hamowanie", "ladowanie_px4"):
+            # Kamera z przodu — dron leci w stronę kamery
+            eye_d = [px + 10.0 * fwd_x, py + 10.0 * fwd_y, pz + 5.0]
+            tgt_d = [px, py, pz + 0.8]
+            alpha_eye = 0.10
+            alpha_tgt = 0.40
+        else:
+            # Chase cam: 9 m z tyłu, 5 m z góry
+            eye_d = [px - 9.0 * fwd_x, py - 9.0 * fwd_y, pz + 5.0]
+            tgt_d = [px, py, pz + 0.8]
+            alpha_eye = 0.10
+            alpha_tgt = 0.40
+
+        if not _cam_eye:
+            _cam_eye[:] = list(eye_d)
+            _cam_tgt[:] = list(tgt_d)
+        else:
+            for i in range(3):
+                _cam_eye[i] += alpha_eye * (eye_d[i] - _cam_eye[i])
+                _cam_tgt[i] += alpha_tgt * (tgt_d[i] - _cam_tgt[i])
+
+        _set_camera_view_fn(
+            eye=_np_cam.array(_cam_eye),
+            target=_np_cam.array(_cam_tgt),
+        )
+    except Exception:
+        pass
+
+
+def _init_attitude_cam(stage) -> None:
+    """Tworzy Camera prim /World/attitude_cam i otwiera Viewport 2 z widokiem od południa.
+    Wywołaj raz po world.reset(), gdy stage jest gotowy i nie jesteśmy w trybie headless.
+    """
+    global _attitude_cam_vp
+    if not _HAS_FOLLOW_CAM:
+        return
+    try:
+        import omni.usd
+        from omni.kit.viewport.utility import create_viewport_window
+        from pxr import Sdf
+
+        st = stage if stage is not None else omni.usd.get_context().get_stage()
+
+        # Utwórz prim kamery (jeśli nie istnieje)
+        cam_path = "/World/attitude_cam"
+        if not st.GetPrimAtPath(cam_path).IsValid():
+            st.DefinePrim(cam_path, "Camera")
+
+        # Otwórz Viewport 2 z tą kamerą
+        _attitude_cam_vp = create_viewport_window(
+            name="Attitude Cam",
+            width=640,
+            height=480,
+            camera_path=Sdf.Path(cam_path),
+        )
+        carb.log_info("Stachometr: Attitude Cam (Viewport 2) gotowy — /World/attitude_cam")
+    except Exception as e:
+        carb.log_warn(f"Stachometr: attitude_cam init: {e}")
+
+
+def _update_attitude_cam(vehicle) -> None:
+    """Kamera 3.5 m przed nosem drona, zawsze patrzy na jego środek — oko w oko."""
+    if not _HAS_FOLLOW_CAM or _attitude_cam_vp is None:
+        return
+    if vehicle is None or not getattr(vehicle, "_state", None):
+        return
+    try:
+        p = vehicle.state.position       # ENU: x=North, y=East, z=Up
+        px, py, pz = float(p[0]), float(p[1]), float(p[2])
+
+        # Yaw z kwaternionu orientacji [w, x, y, z] w ENU
+        q = vehicle.state.attitude       # [w, x, y, z]
+        qw, qx, qy, qz = float(q[0]), float(q[1]), float(q[2]), float(q[3])
+        yaw = math.atan2(2.0 * (qw * qz + qx * qy),
+                         1.0 - 2.0 * (qy * qy + qz * qz))
+
+        # Forward drona w ENU (dziób wskazuje kierunek)
+        fwd_x = math.cos(yaw)
+        fwd_y = math.sin(yaw)
+
+        # Kamera 3.5 m przed dziobem, ta sama wysokość → czyste "oko w oko"
+        dist = 3.5
+        _set_camera_view_fn(
+            eye=_np_cam.array([px + fwd_x * dist, py + fwd_y * dist, pz]),
+            target=_np_cam.array([px, py, pz]),
+            camera_prim_path="/World/attitude_cam",
+            viewport_api=_attitude_cam_vp.viewport_api,
+        )
+    except Exception:
+        pass
+
+
+def _vz_ned_from_altitude_zup(
+    pz_up: float,
+    vz_up: float,
+    z_target_up: float,
+    kp: float,
+    kd: float,
+    cap: float,
+) -> float:
+    """
+    Pegasus/Isaac: position[2] i linear_velocity[2] to oś **w górę** (z rośnie z wysokością).
+    MAVLink OFFBOARD: **vz w NED** — dodatnie = w dół. v_down = −dh/dt przy h = z_up.
+    """
+    dh_dt_cmd = kp * (z_target_up - pz_up) - kd * vz_up
+    vz_ned = -dh_dt_cmd
+    return max(-cap, min(cap, vz_ned))
+
+
 def run_single(
     scenario_id: int,
     run_id: int,
@@ -995,7 +1255,7 @@ def run_single(
     # Start na ziemi (jak w przykładzie Pegasus). Wysokość docelowa z parametrów — osiągniemy przez ARM + TAKEOFF.
     alt_target = float(params.get("altitude_m", params.get("altitude_start_m", 20.0)))
     init_z = 0.07  # nad podłożem, żeby nie kolidować z ziemią
-    # Punkt „startu” na ziemi (XY) — musi być zgodny z pierwszym argumentem pozycji Multirotor poniżej.
+    # Punkt "startu" na ziemi (XY) — musi być zgodny z pierwszym argumentem pozycji Multirotor poniżej.
     # Scenariusz 1: koniec misji, gdy odległość pozioma środka drona od tego punktu >= distance_m (dowolny kierunek).
     spawn_xy = (0.0, 0.0)
 
@@ -1011,6 +1271,10 @@ def run_single(
     world.reset()
 
     _apply_ground_extent_after_world_reset(ground_extent_xy_m)
+    _stage_ref = omni.usd.get_context().get_stage()
+    _init_attitude_cam(_stage_ref)
+    _init_trail_draw()
+    _clear_trail()
 
     csv_path = _log_state_csv_path(output_dir, scenario_id, run_id, run_start_time, wind_suffix=wind_suffix)
 
@@ -1047,6 +1311,7 @@ def run_single(
         "wind_gust_from_schedule",
         "wind_gust_is_lull",
         "setpoint_vel_x", "setpoint_vel_y", "setpoint_vel_z",
+        "seg_phase",
     ]
     log_file = open(csv_path, "w", encoding="utf-8", newline="")
     writer = csv.writer(log_file)
@@ -1054,6 +1319,10 @@ def run_single(
 
     # Mutable: ostatni setpoint prędkości (OFFBOARD) — ustawiane w pętli misji, odczytywane w log_state
     last_setpoint = [0.0, 0.0, 0.0]
+    # Mutable: etykieta aktywnej fazy/manewru (scenariusz 3) — ustawiane w pętli misji, odczytywane w log_state
+    current_seg_label: list[str] = [""]
+    # Mutable: stan podmuchu z poprzedniego kroku — do detekcji startu/końca gustu w flight_timeline
+    _gust_active_prev: list[bool] = [False]
     # Kontekst misji: start_xy = spawn; distance_m = promień / zadany dystans; scenariusz 2: target_xy = punkt lądowania w XY
     mission_ctx: dict = {"start_xy": None, "distance_m": None, "target_xy": None}
     if scenario_id == 1:
@@ -1075,18 +1344,33 @@ def run_single(
     # Pegasus: świeży GT (pozycja, CSV, panel) jest na tym obiekcie. Kolejne pg.get_vehicle() zwraca czasem
     # uchwyt bez aktualnego state — wtedy dystans misji wychodził ~0 i cel 200 m nie kończył runu przy ~900 m na panelu.
     spawn_goal_reached = False
-    # `time_s` w CSV bierzemy z `world.current_time` (prawdziwy czas symulacji fizycznej),
-    # żeby metry/dystans zgadzały się z liczbami z prędkości (bez rozjazdu typu ~4×).
-    physics_dt = 1.0 / 60.0
+    # physics_dt  — wewnętrzny krok fizyki PhysX (1/250 s dla PX4); używany w windgen i MAVLink.
+    # step_dt     — czas symulacji na jedno wywołanie world.step() = rendering_dt (1/60 s).
+    #               Każde _do_step() przesuwa world.current_time o step_dt, NIE o physics_dt.
+    #               Pętle segmentów, mission_time_s, step-counting muszą używać step_dt.
+    physics_dt = 1.0 / 250.0
     try:
         physics_dt = float(world.get_physics_dt())
     except Exception as e:
         carb.log_warn(f"Stachometr: world.get_physics_dt() — {e}; fallback physics_dt={physics_dt}")
     if physics_dt <= 0.0:
-        physics_dt = 1.0 / 60.0
+        physics_dt = 1.0 / 250.0
         carb.log_warn(f"Stachometr: nieprawidłowy physics_dt, używam {physics_dt}")
-    carb.log_info(f"Stachometr: physics_dt={physics_dt:.6f} s/krok (~{1.0/physics_dt:.1f} Hz) — time_s, wiatr, MAVLink")
-    _steps_per_sim_second = max(1, int(round(1.0 / physics_dt)))
+
+    step_dt = 1.0 / 60.0
+    try:
+        step_dt = float(world.get_rendering_dt())
+    except Exception as e:
+        carb.log_warn(f"Stachometr: world.get_rendering_dt() — {e}; fallback step_dt={step_dt}")
+    if step_dt <= 0.0:
+        step_dt = 1.0 / 60.0
+
+    carb.log_info(
+        f"Stachometr: physics_dt={physics_dt:.6f} s ({1.0/physics_dt:.0f} Hz), "
+        f"step_dt={step_dt:.6f} s ({1.0/step_dt:.0f} Hz) — "
+        f"step_dt/physics_dt={step_dt/physics_dt:.2f} sub-steps/frame"
+    )
+    _steps_per_sim_second = max(1, int(round(1.0 / step_dt)))
 
     csv_sim_time_base_s = float(getattr(world, "current_time", 0.0) or 0.0)
     flight_timeline = _FlightTimeline(physics_dt, time_getter=lambda: float(world.current_time) - csv_sim_time_base_s)
@@ -1381,7 +1665,30 @@ def run_single(
                 ]
             )
             row.extend([last_setpoint[0], last_setpoint[1], last_setpoint[2]])
+            row.append(current_seg_label[0])
             writer.writerow(row)
+            # Attitude cam + trail update (każdy krok, wszystkie scenariusze)
+            _update_attitude_cam(vehicle)
+            _update_trail(vehicle)
+            # Gust transition detection → flight_timeline event
+            gust_now = bool(last_wind_log.get("wind_is_gust", 0))
+            if gust_now and not _gust_active_prev[0]:
+                flight_timeline.mark(
+                    "gust_start", step_count,
+                    wind_speed_n_ms=round(float(last_wind_log["wind_vel_n"]), 3),
+                    wind_speed_e_ms=round(float(last_wind_log["wind_vel_e"]), 3),
+                    gust_from_schedule=bool(last_wind_log.get("wind_gust_from_schedule", 0)),
+                    gust_is_lull=bool(last_wind_log.get("wind_gust_is_lull", 0)),
+                    seg_phase=current_seg_label[0],
+                )
+            elif not gust_now and _gust_active_prev[0]:
+                flight_timeline.mark(
+                    "gust_end", step_count,
+                    wind_speed_n_ms=round(float(last_wind_log["wind_vel_n"]), 3),
+                    wind_speed_e_ms=round(float(last_wind_log["wind_vel_e"]), 3),
+                    seg_phase=current_seg_label[0],
+                )
+            _gust_active_prev[0] = gust_now
             if live_display:
                 live_display.update(
                     vehicle,
@@ -1389,12 +1696,13 @@ def run_single(
                     flown_m=flown_m,
                     distance_m_cel=mission_ctx.get("distance_m"),
                     wind_snapshot=last_wind_log if wind_suffix == "wind" else None,
+                    current_phase=current_seg_label[0] if current_seg_label[0] else None,
                 )
 
     step = 0
 
     # 1) Rozgrzewka (etykieta: rozgrzewka) — logowanie od t=0; dajemy PX4 czas na start
-    warmup_steps = int(WARMUP_S / physics_dt)
+    warmup_steps = int(WARMUP_S / step_dt)
     for _ in range(warmup_steps):
         if not simulation_app.is_running():
             break
@@ -1423,8 +1731,15 @@ def run_single(
 
                 # Kluczowe: ustaw limity prędkości PX4 PRZED ARM/takeoff.
                 # Wiele parametrów bywa odrzucanych/ignorowanych po uzbrojeniu.
-                if scenario_id in (1, 2):
-                    _prearm_v_cmd = float(params.get("v_cmd_ms", 10.0) or 10.0)
+                if scenario_id in (1, 2, 3):
+                    if scenario_id == 3:
+                        _seg_v_max = max(
+                            (float(s.get("v_end_ms", 0)) for s in params.get("segments", [])),
+                            default=20.0,
+                        )
+                        _prearm_v_cmd = max(float(params.get("v_initial_ms", 20.0)), _seg_v_max)
+                    else:
+                        _prearm_v_cmd = float(params.get("v_cmd_ms", 10.0) or 10.0)
                     _prearm_px4_lim = _px4_velocity_mission_limits(params, _prearm_v_cmd)
                     # Preferuj dwukierunkowy link parametryczny:
                     # - udpin:14550 (GCS) najczęściej dostaje broadcast PARAM_VALUE
@@ -1505,7 +1820,7 @@ def run_single(
 
                 mav_out.set_mode_takeoff_px4()
                 flight_timeline.mark_once("px4_auto_takeoff_mode_command_sent", step)
-                for _ in range(int(0.5 / physics_dt)):
+                for _ in range(int(0.5 / step_dt)):
                     if not simulation_app.is_running():
                         break
                     _do_step()
@@ -1528,7 +1843,7 @@ def run_single(
 
     # 3) Wznoszenie (etykieta: wznoszenie) — logowanie
     if not spawn_goal_reached:
-        takeoff_steps = int(TAKEOFF_WAIT_S / physics_dt)
+        takeoff_steps = int(TAKEOFF_WAIT_S / step_dt)
         takeoff_end_reason = "takeoff_wait_full_duration"
         for _ in range(takeoff_steps):
             if not simulation_app.is_running():
@@ -1561,7 +1876,7 @@ def run_single(
                 f"przy v={float(v_cmd):.1f} m/s — **wydłużam fazę misji** do ~{_need_mission_s:.0f}s (ustaw wyższe --duration-s dla pełnej kontroli)."
             )
             mission_duration_s = _need_mission_s
-        steps_total = int(mission_duration_s / physics_dt)
+        steps_total = int(mission_duration_s / step_dt)
         yaw_rad = math.radians(yaw_deg)
         vx = v_cmd * math.cos(yaw_rad)
         vy = v_cmd * math.sin(yaw_rad)
@@ -1581,7 +1896,7 @@ def run_single(
         carb.log_info(
             f"Scenariusz 1: punkt odniesienia dystansu = spawn xy=({spawn_xy[0]:.2f}, {spawn_xy[1]:.2f}), "
             f"cel: ≥{distance_m:.0f} m w poziomie od spawnu. "
-            "Komunikaty „przeleciono … m” i „koniec misji” w tym samym logu (terminal / Isaac Sim Console)."
+            'Komunikaty "przeleciono ... m" i "koniec misji" w tym samym logu (terminal / Isaac Sim Console).'
         )
         if _var_frac > 0.0:
             carb.log_info(
@@ -1690,7 +2005,7 @@ def run_single(
                     log_state(step)
                     _maybe_mark_spawn_goal_done()
                     step += 1
-                    mission_time_s += physics_dt
+                    mission_time_s += step_dt
                     if spawn_goal_reached:
                         break
                 mav_mission.close()
@@ -1707,7 +2022,7 @@ def run_single(
                     log_state(step)
                     _maybe_mark_spawn_goal_done()
                     step += 1
-                    mission_time_s += physics_dt
+                    mission_time_s += step_dt
                     if spawn_goal_reached:
                         break
         except Exception as e:
@@ -1724,7 +2039,7 @@ def run_single(
                 log_state(step)
                 _maybe_mark_spawn_goal_done()
                 step += 1
-                mission_time_s += physics_dt
+                mission_time_s += step_dt
                 if spawn_goal_reached:
                     break
 
@@ -1750,7 +2065,7 @@ def run_single(
                     f"Scenariusz 2: --duration-s={mission_duration_s:.0f}s za małe na lot+lądowanie — wydłużam do ~{_need_mission_s:.0f}s."
                 )
                 mission_duration_s = _need_mission_s
-            steps_total = int(mission_duration_s / physics_dt)
+            steps_total = int(mission_duration_s / step_dt)
             yaw_rad = math.radians(yaw_deg)
             vx_cruise = v_cmd * math.cos(yaw_rad)
             vy_cruise = v_cmd * math.sin(yaw_rad)
@@ -1773,7 +2088,7 @@ def run_single(
             z_vz_cap = float(params.get("land_brake_z_vz_cap_ms", 2.2))
             z_land = float(params.get("landed_pos_z_max_m", 0.4))
             v_land = float(params.get("landed_total_speed_max_ms", 0.6))
-            land_timeout_steps = int(land_to / physics_dt)
+            land_timeout_steps = int(land_to / step_dt)
             land_stream_n = 15
             s2_first_cmd = True
             s2_cruise_fast_since: float | None = None
@@ -1786,22 +2101,6 @@ def run_single(
             touchdown_sim_time_s: float | None = None
             post_touchdown_disarm_sent = False
             disarm_sent_sim_time_s: float | None = None
-
-            def _vz_ned_from_altitude_zup(
-                pz_up: float,
-                vz_up: float,
-                z_target_up: float,
-                kp: float,
-                kd: float,
-                cap: float,
-            ) -> float:
-                """
-                Pegasus/Isaac: position[2] i linear_velocity[2] to oś **w górę** (jak takeoff: z rośnie z wysokością).
-                MAVLink OFFBOARD: **vz w NED** — dodatnie = w dół. v_down = −dh/dt przy h = z_up.
-                """
-                dh_dt_cmd = kp * (z_target_up - pz_up) - kd * vz_up
-                vz_ned = -dh_dt_cmd
-                return max(-cap, min(cap, vz_ned))
 
             def _flown_spawn_s2() -> float:
                 if vehicle is None or getattr(vehicle, "state", None) is None:
@@ -1827,7 +2126,7 @@ def run_single(
             mav_mission = None
 
             # Acceleration phase recognition (cruise start):
-            # „ruszanie” od małych v_xy do blisko v_cmd (Vmax w praktyce).
+            # "ruszanie" od małych v_xy do blisko v_cmd (Vmax w praktyce).
             s2_acc_started = False
             s2_acc_start_v_xy_ms: float | None = None
             s2_acc_peak_accel_xy_m_s2: float | None = None
@@ -2005,7 +2304,7 @@ def run_single(
                                                         s2_acc_peak_v_before = float(s2_acc_prev_v_xy)
                                                         s2_acc_peak_v_after = vh2
                                                         s2_acc_peak_step = step
-                                                        # Znacznik dla „peak” nie jest potrzebny do stabilnego
+                                                        # Znacznik dla "peak" nie jest potrzebny do stabilnego
                                                         # etykietowania końca przyspieszenia (wystarczy start + near_vmax).
 
                                             # Update measured vmax peak while accelerating.
@@ -2164,7 +2463,7 @@ def run_single(
                                         )
                                     )
                                 else:
-                                    # Pełne zatrzymanie w poziomie (nie −k·v — to powodowało „skręt” i dalszy lot).
+                                    # Pełne zatrzymanie w poziomie (nie −k·v — to powodowało "skręt" i dalszy lot).
                                     vx_sp = 0.0
                                     vy_sp = 0.0
                                     last_setpoint[0] = vx_sp
@@ -2263,8 +2562,216 @@ def run_single(
                     except Exception:
                         pass
 
+    elif not spawn_goal_reached and scenario_id == 3 and HAS_MAVLINK_OFFBOARD:
+        # Scenariusz 3: sekwencja segmentów (sprint/hamowanie/wznoszenie/zakręty/slalomy).
+        # Każdy segment — liniowa interpolacja v, PD wysokości, obrót nagłówku o omega*dt.
+        segments = params.get("segments", [])
+        z_kp = float(params.get("s3_z_kp", 1.35))
+        z_kd = float(params.get("s3_z_kd", 0.7))
+        z_cap = float(params.get("s3_z_vz_cap_ms", 4.0))
+        z_kp_b = float(params.get("s3_z_kp_boost", 1.9))
+        z_boost_s = float(params.get("s3_z_kp_boost_s", 8.0))
+        heading = math.radians(float(params.get("yaw_start_deg", 0.0)))
+
+        def _interp_v(v0: float, v1: float, t: float, ramp_s: float) -> float:
+            return v0 + (v1 - v0) * min(1.0, t / max(ramp_s, step_dt))
+
+        def _z_ramp(z0: float, z1: float, t: float, dur: float) -> float:
+            return z0 + (z1 - z0) * min(1.0, t / max(dur, step_dt))
+
+        def _get_vz(veh, z_tgt: float, kp: float, kd: float, cap: float) -> float:
+            if veh is None or not getattr(veh, "_state", None):
+                return 0.0
+            p = veh.state.position
+            lv = veh.state.linear_velocity
+            return _vz_ned_from_altitude_zup(float(p[2]), float(lv[2]), z_tgt, kp, kd, cap)
+
+        try:
+            mav3 = MavlinkOffboard("udpout:127.0.0.1:14580")
+            if mav3.bind():
+                mav3.force_px4_sitl_target()
+                if not mav3.try_recv_heartbeat():
+                    for _ in range(20):
+                        if mav3.try_recv_heartbeat():
+                            break
+                mav3.force_px4_sitl_target()
+                mav3.set_mode_offboard()
+                mission_time_s = 0.0
+                flight_timeline.mark_once("offboard_velocity_stream_started", step, scenario_id=3)
+
+                for seg_idx, seg in enumerate(segments):
+                    if not simulation_app.is_running():
+                        break
+                    seg_type = seg.get("type", "sprint")
+                    v_start = float(seg["v_start_ms"])
+                    v_end = float(seg["v_end_ms"])
+                    dur = float(seg["duration_s"])
+                    z_start = float(seg.get("z_start_m", 15.0))
+                    z_end = float(seg.get("z_end_m", z_start))
+                    ramp_s = float(seg.get("accel_ramp_s", dur))
+                    radius_m = float(seg.get("radius_m", 0.0))
+                    turn_dir = float(seg.get("turn_dir", 0.0))
+                    n_ht = max(1, int(seg.get("n_halfturns", 1)))
+                    phase_lbl = seg.get("phase_label", "lot")
+                    seg_steps = max(1, int(dur / step_dt))
+
+                    current_seg_label[0] = phase_lbl
+                    carb.log_info(
+                        f"Scen3 seg {seg_idx + 1}/{len(segments)} [{phase_lbl}] "
+                        f"v={v_start:.1f}→{v_end:.1f} m/s z={z_start:.1f}→{z_end:.1f} m "
+                        f"R={radius_m:.0f} m dur={dur:.1f} s"
+                    )
+                    flight_timeline.mark(
+                        "segment_start", step,
+                        seg_idx=seg_idx,
+                        seg_type=seg_type,
+                        phase_label=phase_lbl,
+                        v_start_ms=round(v_start, 2),
+                        v_end_ms=round(v_end, 2),
+                        z_start_m=round(z_start, 1),
+                        z_end_m=round(z_end, 1),
+                        radius_m=round(radius_m, 1),
+                        angle_deg=round(float(seg.get("angle_deg", 0.0)), 1),
+                        turn_dir=int(turn_dir),
+                        duration_s=round(dur, 2),
+                        n_halfturns=n_ht if seg_type.startswith("slalom") else 1,
+                    )
+
+                    if seg_type.startswith("slalom"):
+                        ht_steps = max(1, seg_steps // n_ht)
+                        total_done = 0
+                        for ht in range(n_ht):
+                            if not simulation_app.is_running():
+                                break
+                            d_now = turn_dir * ((-1.0) ** ht)
+                            for i in range(ht_steps):
+                                if not simulation_app.is_running():
+                                    break
+                                t_in = (total_done + i) * step_dt
+                                v = _interp_v(v_start, v_end, t_in, ramp_s)
+                                om = (v / radius_m) * d_now if radius_m > 0.0 else 0.0
+                                heading += om * physics_dt
+                                z_tgt = _z_ramp(z_start, z_end, t_in, dur)
+                                kp_use = z_kp_b if mission_time_s < z_boost_s else z_kp
+                                vz = _get_vz(vehicle, z_tgt, kp_use, z_kd, z_cap)
+                                vx = v * math.cos(heading)
+                                vy = v * math.sin(heading)
+                                last_setpoint[:] = [vx, vy, vz]
+                                mav3.send_velocity_target_ned(int(step * physics_dt * 1000), vx, vy, vz)
+                                _do_step()
+                                log_state(step)
+                                _update_follow_camera(vehicle, heading, current_seg_label[0])
+                                step += 1
+                                mission_time_s += step_dt
+                            total_done += ht_steps
+                    else:
+                        for i in range(seg_steps):
+                            if not simulation_app.is_running():
+                                break
+                            t_in = i * step_dt
+                            v = _interp_v(v_start, v_end, t_in, ramp_s)
+                            om = (v / radius_m) * turn_dir if radius_m > 0.0 else 0.0
+                            heading += om * physics_dt
+                            z_tgt = _z_ramp(z_start, z_end, t_in, dur)
+                            kp_use = z_kp_b if mission_time_s < z_boost_s else z_kp
+                            vz = _get_vz(vehicle, z_tgt, kp_use, z_kd, z_cap)
+                            vx = v * math.cos(heading)
+                            vy = v * math.sin(heading)
+                            last_setpoint[:] = [vx, vy, vz]
+                            mav3.send_velocity_target_ned(int(step * physics_dt * 1000), vx, vy, vz)
+                            _do_step()
+                            log_state(step)
+                            _update_follow_camera(vehicle, heading, current_seg_label[0])
+                            step += 1
+                            mission_time_s += step_dt
+
+                    flight_timeline.mark(
+                        "segment_end", step,
+                        seg_idx=seg_idx,
+                        seg_type=seg_type,
+                        phase_label=phase_lbl,
+                    )
+
+                current_seg_label[0] = ""
+                flight_timeline.mark_once("scenario_3_segments_complete", step, segments_count=len(segments))
+
+                # Lądowanie: hamowanie (vx=vy=0, hold z) → PX4 AUTO LAND + NAV_LAND → touchdown → DISARM
+                current_seg_label[0] = "hamowanie"
+                brake_s = float(params.get("s3_land_brake_s", 6.0))
+                bz_kp = float(params.get("s3_land_brake_z_kp", 1.45))
+                bz_kd = float(params.get("s3_land_brake_z_kd", 0.65))
+                bz_cap = float(params.get("s3_land_brake_z_vz_cap_ms", 2.5))
+                brake_z_hold = None
+                if vehicle is not None and getattr(vehicle, "_state", None) is not None:
+                    brake_z_hold = float(vehicle.state.position[2])
+                for _ in range(max(1, int(brake_s / step_dt))):
+                    if not simulation_app.is_running():
+                        break
+                    vz = _get_vz(vehicle, brake_z_hold, bz_kp, bz_kd, bz_cap) if brake_z_hold else 0.0
+                    last_setpoint[:] = [0.0, 0.0, vz]
+                    mav3.send_velocity_target_ned(int(step * physics_dt * 1000), 0.0, 0.0, vz)
+                    _do_step()
+                    log_state(step)
+                    _update_follow_camera(vehicle, heading, current_seg_label[0])
+                    step += 1
+                    mission_time_s += step_dt
+
+                current_seg_label[0] = "ladowanie_px4"
+                mav3.set_mode_auto_land_px4()
+                mav3.send_nav_land_in_place()
+                flight_timeline.mark_once("scenario_3_auto_land_commanded", step)
+                carb.log_info("Scenariusz 3: AUTO LAND + NAV_LAND — czekam na touchdown.")
+
+                z_land_max = float(params.get("s3_land_z_max_m", 0.4))
+                v_land_max = float(params.get("s3_land_v_max_ms", 0.6))
+                land_timeout_steps = int(float(params.get("s3_land_timeout_s", 120.0)) / step_dt)
+                after_td_s = float(params.get("s3_land_after_touchdown_s", 2.0))
+                after_dis_s = float(params.get("s3_land_after_disarm_s", 2.0))
+                touchdown_sim_t: float | None = None
+                disarm_sent_s3 = False
+                disarm_t_s3: float | None = None
+
+                for _ in range(land_timeout_steps):
+                    if not simulation_app.is_running():
+                        break
+                    last_setpoint[:] = [0.0, 0.0, 0.0]
+                    _do_step()
+                    log_state(step)
+                    _update_follow_camera(vehicle, heading, current_seg_label[0])
+                    step += 1
+                    mission_time_s += step_dt
+                    if vehicle is not None and getattr(vehicle, "_state", None) is not None:
+                        p3 = vehicle.state.position
+                        lv3 = vehicle.state.linear_velocity
+                        spd3 = math.sqrt(sum(float(x) ** 2 for x in lv3))
+                        now3 = float(getattr(world, "current_time", 0.0) or 0.0)
+                        if touchdown_sim_t is None and float(p3[2]) <= z_land_max and spd3 < v_land_max:
+                            touchdown_sim_t = now3
+                            flight_timeline.mark_once(
+                                "touchdown_stable_ground_truth", step,
+                                pos_z_m=float(p3[2]), total_speed_ms=spd3,
+                            )
+                            carb.log_info(f"Scenariusz 3: touchdown (z={float(p3[2]):.2f} m, v={spd3:.2f} m/s).")
+                        if touchdown_sim_t is not None:
+                            if not disarm_sent_s3 and now3 - touchdown_sim_t >= after_td_s:
+                                mav3.disarm()
+                                disarm_sent_s3 = True
+                                disarm_t_s3 = now3
+                                flight_timeline.mark_once("px4_disarm_command_sent", step)
+                            if disarm_sent_s3 and disarm_t_s3 is not None and now3 - disarm_t_s3 >= after_dis_s:
+                                carb.log_info("Scenariusz 3: koniec run po DISARM.")
+                                break
+
+                current_seg_label[0] = ""
+                mav3.close()
+            else:
+                carb.log_warn("Scenariusz 3: MAVLink bind nieudany — brak OFFBOARD.")
+        except Exception as e:
+            carb.log_warn(f"Scenariusz 3: {e}")
+            current_seg_label[0] = ""
+
     elif not spawn_goal_reached:
-        steps_total = int(duration_s / physics_dt)
+        steps_total = int(duration_s / step_dt)
         for _ in range(steps_total):
             if not simulation_app.is_running():
                 break
@@ -2347,15 +2854,15 @@ def main():
     for run_id in range(runs):
         seed = (args.seed + run_id) if args.seed is not None else None
         params = draw_scenario(scenario_id, seed=seed)
-        if scenario_id in (1, 2):
+        if scenario_id in (1, 2, 3):
             params["scenario_1_runs"] = [
                 {"wind_suffix": "wind", "wind_enabled": True},
             ]
         run_start_time = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
         _save_params_json(params, scenario_id, run_id, output_dir, run_start_time)
 
-        if scenario_id in (1, 2):
-            # Scenariusze 1 i 2 (losowane): przelot **z wiatrem** (CSV *_wind_state.csv)
+        if scenario_id in (1, 2, 3):
+            # Scenariusze 1, 2, 3 (losowane): przelot **z wiatrem** (CSV *_wind_state.csv)
             run_single(
                 scenario_id=scenario_id,
                 run_id=run_id,

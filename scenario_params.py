@@ -26,7 +26,11 @@ PHASE_LABELS_DOC = (
 SCENARIO_DESCRIPTIONS = {
     1: "Lot prosto 500–1000 m (losowy dystans), wysokość modulowana w locie (±5%); wiatr ~75% U(2,4) m/s, ~25% U(0.01,9) (ogon). Każdy run z wiatrem.",
     2: "Jak scenariusz 1 (±5% wys.): lot do celu 500–1000 m (yaw), wycentrowanie XY, zejście pionowe, PX4 AUTO LAND. Wiatr jak w scenariuszu 1.",
-    3: "Jedno przyspieszanie 0 → V_max na 200 m. Start z zatrzymania, przyspieszanie do V_max.",
+    3: (
+        "Zakręty (łagodny/średni/ostry/gwałtowny), zawroty (>150°), slalomy L-R, lot jednostajny (2×), "
+        "zmiany prędkości i wysokości. Prędkości 5–30 m/s. "
+        "Sekwencja 14 segmentów (12 typów obowiązkowych + 2× lot_jednostajny). Wiatr jak scen. 1/2. Wysokość 10–40 m."
+    ),
     4: "Zawis (hover) z zakłóceniami wiatru. Utrzymanie pozycji, wiatr zmienia się w czasie.",
     5: "Ósemki / slalomy. Lot po torze: ósemka lub slalom lewo-prawo.",
     6: "Wznoszenie / opadanie pod kątem (200 m w poziomie). Lot 200 m z jednoczesnym wznoszeniem/opadaniem.",
@@ -315,8 +319,296 @@ def draw_scenario_2() -> dict:
 
 
 def draw_scenario_3() -> dict:
-    # Snippet: Jedno przyspieszanie 0 → V_max na 200 m. Start z zatrzymania, przyspieszanie do V_max.
-    return _stub_scenario(3, "przyspieszanie_0_Vmax_200m", "przyspieszanie od 0 do V_max na 200 m")
+    """
+    Scenariusz 3: wszystkie 11 typów manewrów (każdy co najmniej raz), krótkie segmenty 10–20 s
+    (arc_lagodny do 25 s), łącznie ~2–2.5 min misji + lądowanie jak scen. 2.
+    Lot w obrębie ~2 km×2 km: prędkości 5–18 m/s, skrócone łuki.
+    """
+    _ALL_TYPES = [
+        "sprint", "brake", "climb_sprint", "descent_sprint",
+        "arc_lagodny", "arc_sredni", "arc_ostry", "sharp_reversal",
+        "slalom_lagodny", "slalom_sredni", "slalom_ostry",
+        "zawrot",
+    ]
+
+    def _cv(v: float) -> float:
+        return max(5.0, min(30.0, v))
+
+    def _cz(z: float) -> float:
+        return max(10.0, min(40.0, z))
+
+    def _arc_dur(angle_deg: float, radius_m: float, v: float, max_s: float) -> tuple[float, float]:
+        """Zwraca (duration_s, angle_deg) — jeśli byłoby za długo, skraca kąt."""
+        dur = math.radians(angle_deg) * radius_m / max(v, 1.0)
+        if dur > max_s:
+            angle_deg = math.degrees(max_s * max(v, 1.0) / radius_m)
+            dur = max_s
+        return max(8.0, dur), max(30.0, angle_deg)
+
+    v_current = _r(10.0, 22.0)
+    z_current = _r(15.0, 28.0)
+    heading_start = _r(0.0, 360.0)
+
+    # Buduj listę typów: wszystkie 12 obowiązkowo + 2× lot_jednostajny, w losowej kolejności.
+    # Sprint zawsze pierwszy; reszta przetasowana.
+    mandatory = list(_ALL_TYPES) + ["lot_jednostajny", "lot_jednostajny"]
+    mandatory.remove("sprint")
+    random.shuffle(mandatory)
+    type_sequence = ["sprint"] + mandatory
+
+    # Wstaw wymuszone sprinty (recovery) po sharp_reversal i arc_ostry.
+    # Nie możemy jeszcze wiedzieć które to będą, więc zrobimy post-processing.
+    # Buduj segmenty iteracyjnie.
+    segments: list[dict] = []
+    remaining = list(type_sequence)  # kolejka typów do wykonania
+
+    while remaining:
+        seg_type = remaining.pop(0)
+
+        # Jeśli poprzedni był sharp_reversal, arc_ostry lub zawrot, a obecny nie jest sprint —
+        # wstaw sprint przed nim.
+        if segments and segments[-1]["type"] in ("sharp_reversal", "arc_ostry", "zawrot") and seg_type != "sprint":
+            remaining.insert(0, seg_type)
+            seg_type = "sprint"
+
+        v_start = v_current
+        radius_m = 0.0
+        turn_dir = 0
+        n_halfturns = 1
+        angle_deg = 0.0
+        a_c = 0.0
+
+        if seg_type == "sprint":
+            v_end = _cv(v_start + _r(3.0, 10.0))
+            z_end = _cz(z_current + _r(0.0, 5.0))
+            duration_s = _r(2.0, 10.0)
+            accel_ramp_s = duration_s * 0.65
+            phase_label = "przyspieszanie"
+
+        elif seg_type == "brake":
+            # hamowanie blisko zera — v_end z szerokiego zakresu, ale docelowo niska prędkość
+            v_end = _cv(v_start - _r(v_start * 0.5, v_start * 0.95))
+            z_end = _cz(z_current - _r(0.0, 4.0))
+            duration_s = _r(3.0, 6.0)
+            accel_ramp_s = duration_s * 0.85
+            phase_label = "hamowanie"
+
+        elif seg_type == "climb_sprint":
+            v_end = _cv(v_start * _r(0.9, 1.1))
+            dz = _r(8.0, 20.0)
+            z_end = _cz(z_current + dz)
+            duration_s = _r(2.0, 8.0)
+            accel_ramp_s = duration_s
+            phase_label = "wznoszenie"
+
+        elif seg_type == "descent_sprint":
+            v_end = _cv(v_start * _r(0.9, 1.1))
+            # Gwałtowne opadanie: duża różnica wysokości w krótkim czasie
+            dz = _r(8.0, 20.0)
+            z_end = _cz(z_current - dz)
+            duration_s = _r(2.0, 8.0)
+            accel_ramp_s = duration_s
+            phase_label = "opadanie"
+
+        elif seg_type == "arc_lagodny":
+            radius_m = _r(60.0, 150.0)
+            v_end = _cv(v_start * _r(0.95, 1.05))
+            angle_deg = _r(60.0, 180.0)
+            turn_dir = random.choice([-1, 1])
+            duration_s, angle_deg = _arc_dur(angle_deg, radius_m, v_start, 25.0)
+            accel_ramp_s = duration_s
+            z_end = _cz(z_current + _r(2.0, 4.0) * random.choice([-1, 1]))
+            a_c = v_start ** 2 / radius_m
+            phase_label = "zakret_lagodny"
+
+        elif seg_type == "arc_sredni":
+            radius_m = _r(20.0, 60.0)
+            v_entry = _cv(v_start * 0.85)
+            v_end = v_entry
+            angle_deg = _r(60.0, 150.0)
+            turn_dir = random.choice([-1, 1])
+            duration_s, angle_deg = _arc_dur(angle_deg, radius_m, v_entry, 20.0)
+            accel_ramp_s = duration_s * 0.3
+            z_end = _cz(z_current + _r(2.0, 6.0))
+            a_c = v_entry ** 2 / radius_m
+            phase_label = "zakret_sredni" if a_c < 5.0 else "zakret_ostry"
+
+        elif seg_type == "arc_ostry":
+            radius_m = _r(8.0, 22.0)
+            v_entry = _cv(v_start * 0.75)
+            v_end = v_entry
+            angle_deg = _r(60.0, 120.0)
+            turn_dir = random.choice([-1, 1])
+            duration_s, angle_deg = _arc_dur(angle_deg, radius_m, v_entry, 18.0)
+            accel_ramp_s = duration_s * 0.2
+            z_end = _cz(z_current + _r(3.0, 8.0))
+            a_c = v_entry ** 2 / radius_m
+            phase_label = "zakret_ostry" if a_c < 15.0 else "zakret_gwaltowny"
+
+        elif seg_type == "sharp_reversal":
+            radius_m = _r(3.0, 10.0)
+            v_entry = _cv(v_start * 0.5)
+            v_end = v_entry
+            angle_deg = _r(120.0, 180.0)
+            turn_dir = random.choice([-1, 1])
+            duration_s, angle_deg = _arc_dur(angle_deg, radius_m, v_entry, 16.0)
+            accel_ramp_s = duration_s * 0.5
+            z_end = _cz(z_current + _r(4.0, 10.0))
+            a_c = v_entry ** 2 / radius_m
+            phase_label = "zakret_gwaltowny"
+
+        elif seg_type == "zawrot":
+            # Zawrót (U-turn) >150°: zwinny, szybki, mały promień.
+            # Promień 4-8m + wysoka prędkość → czas trwania 2-4 s symulacyjne.
+            radius_m = _r(4.0, 8.0)
+            v_entry = _cv(v_start * _r(0.6, 0.85))
+            v_end = v_entry
+            angle_deg = _r(160.0, 200.0)
+            turn_dir = random.choice([-1, 1])
+            duration_s = max(2.0, min(4.0, math.radians(angle_deg) * radius_m / max(v_entry, 1.0)))
+            accel_ramp_s = duration_s * 0.3
+            z_end = _cz(z_current + _r(2.0, 6.0))
+            a_c = v_entry ** 2 / radius_m
+            phase_label = "zawrot"
+
+        elif seg_type == "slalom_lagodny":
+            # Łagodne wahnięcia L-R; budżet 10-18s, min 10 half-turnów (5 cykli)
+            # Kąt max 25° na wahnięcie — widoczne ale nie skręca z trasy
+            radius_m = _r(25.0, 60.0)
+            v_end = _cv(v_start)
+            omega = v_start / max(radius_m, 0.1)
+            max_ht_s = math.radians(30.0) / max(omega, 0.01)
+            half_turn_s = min(_r(0.8, 2.0), max_ht_s)
+            half_turn_s = max(0.4, half_turn_s)
+            budget_s = _r(10.0, 18.0)
+            n_halfturns = max(10, int(budget_s / half_turn_s))
+            if n_halfturns % 2 != 0:
+                n_halfturns += 1
+            duration_s = n_halfturns * half_turn_s
+            angle_deg = math.degrees(omega * half_turn_s)
+            turn_dir = random.choice([-1, 1])
+            accel_ramp_s = duration_s
+            z_end = _cz(z_current + _r(1.0, 3.0) * random.choice([-1, 1]))
+            a_c = v_start ** 2 / radius_m
+            phase_label = "slalom_lagodny"
+
+        elif seg_type == "slalom_sredni":
+            # Wyraźne wahnięcia; budżet 8-16s, min 10 half-turnów; kąt max 55°
+            radius_m = _r(10.0, 28.0)
+            v_end = _cv(v_start * _r(0.88, 1.05))
+            omega = v_start / max(radius_m, 0.1)
+            max_ht_s = math.radians(66.0) / max(omega, 0.01)
+            half_turn_s = min(_r(0.5, 1.5), max_ht_s)
+            half_turn_s = max(0.3, half_turn_s)
+            budget_s = _r(8.0, 16.0)
+            n_halfturns = max(10, int(budget_s / half_turn_s))
+            if n_halfturns % 2 != 0:
+                n_halfturns += 1
+            duration_s = n_halfturns * half_turn_s
+            angle_deg = math.degrees(omega * half_turn_s)
+            turn_dir = random.choice([-1, 1])
+            accel_ramp_s = duration_s * 0.5
+            z_end = _cz(z_current + _r(2.0, 5.0) * random.choice([-1, 1]))
+            a_c = v_start ** 2 / radius_m
+            phase_label = "slalom_sredni"
+
+        elif seg_type == "slalom_ostry":
+            # Agresywne wahnięcia; budżet 6-14s, min 10 half-turnów; kąt 56–80° na wahnięcie
+            # Losuję kąt i czas wahnięcia → R = v / omega (gwarantuje zakres kąta)
+            v_end = _cv(v_start * 0.8)
+            angle_ht_rad = _r(math.radians(67.2), math.radians(96.0))
+            half_turn_s = _r(0.4, 1.2)
+            omega = angle_ht_rad / half_turn_s
+            radius_m = max(2.5, v_end / max(omega, 0.1))
+            budget_s = _r(6.0, 14.0)
+            n_halfturns = max(10, int(budget_s / half_turn_s))
+            if n_halfturns % 2 != 0:
+                n_halfturns += 1
+            duration_s = n_halfturns * half_turn_s
+            angle_deg = math.degrees(omega * half_turn_s)
+            turn_dir = random.choice([-1, 1])
+            accel_ramp_s = duration_s * 0.3
+            z_end = _cz(z_current + _r(2.0, 6.0) * random.choice([-1, 1]))
+            a_c = v_end ** 2 / radius_m
+            phase_label = "slalom_ostry"
+
+        elif seg_type == "lot_jednostajny":
+            # Lot jednostajny ~15 s: stała prędkość (±5%), prosta trasa, lekka zmiana wysokości.
+            v_end = _cv(v_start * _r(0.95, 1.05))
+            z_end = _cz(z_current + _r(-3.0, 3.0))
+            duration_s = _r(12.0, 18.0)
+            accel_ramp_s = 2.0
+            phase_label = "lot_jednostajny"
+
+        else:
+            v_end = v_start
+            z_end = z_current
+            duration_s = 10.0
+            accel_ramp_s = 10.0
+            phase_label = "lot_prosty"
+
+        seg: dict[str, Any] = {
+            "type": seg_type,
+            "v_start_ms": round(v_start, 3),
+            "v_end_ms": round(v_end, 3),
+            "accel_ramp_s": round(accel_ramp_s, 3),
+            "duration_s": round(duration_s, 3),
+            "z_start_m": round(z_current, 3),
+            "z_end_m": round(z_end, 3),
+            "radius_m": round(radius_m, 3),
+            "angle_deg": round(angle_deg, 3),
+            "turn_dir": int(turn_dir),
+            "n_halfturns": int(n_halfturns),
+            "phase_label": phase_label,
+            "a_c_ms2": round(a_c, 4),
+        }
+        segments.append(seg)
+        v_current = v_end
+        z_current = z_end
+
+    t_acc = 0.0
+    phase_times: list[dict] = []
+    for seg in segments:
+        phase_times.append({
+            "phase": seg["phase_label"],
+            "t_start_s": round(t_acc, 3),
+            "t_end_s": round(t_acc + seg["duration_s"], 3),
+        })
+        t_acc += seg["duration_s"]
+
+    base: dict[str, Any] = {
+        "scenario_id": 3,
+        "scenario_name": "zakręty_slalomy_zmiana_v_i_h",
+        "yaw_start_deg": round(heading_start, 3),
+        "altitude_initial_m": round(segments[0]["z_start_m"], 3),
+        "v_initial_ms": round(segments[0]["v_start_ms"], 3),
+        "wind_speed_ms": _draw_wind_speed_scenario_1(),
+        "wind_dir_deg": _r(0.0, 360.0),
+        "wind_dynamic_enabled": True,
+        "wind_gust_prob_per_s": 0.030,   # wyraźnie wyższy niż default 0.018 → ~3-4 podmuchy/2 min
+        "s3_z_kp": 1.35,
+        "s3_z_kd": 0.7,
+        "s3_z_vz_cap_ms": 4.0,
+        "s3_z_kp_boost": 1.9,
+        "s3_z_kp_boost_s": 8.0,
+        # Lądowanie po segmentach (jak scen. 2)
+        "s3_land_brake_s": 2.0,
+        "s3_land_brake_z_kp": 1.45,
+        "s3_land_brake_z_kd": 0.65,
+        "s3_land_brake_z_vz_cap_ms": 2.5,
+        "s3_land_z_max_m": 0.4,
+        "s3_land_v_max_ms": 0.6,
+        "s3_land_timeout_s": 120.0,
+        "s3_land_after_touchdown_s": 2.0,
+        "s3_land_after_disarm_s": 2.0,
+        "segments": segments,
+        "phase_times": phase_times,
+        "phase_times_description": (
+            "Jeden wpis na segment + faza ladowanie_px4 na końcu. "
+            "t_start/t_end szacowane. Wszystkie 12 typów manewrów wystąpią przynajmniej raz."
+        ),
+    }
+    return merge_wind_defaults(base)
 
 
 def draw_scenario_4() -> dict:

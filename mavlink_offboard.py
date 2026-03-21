@@ -244,12 +244,24 @@ class MavlinkOffboard:
         )
         return True
 
-    def send_velocity_target_ned(self, time_boot_ms: int, vx: float, vy: float, vz: float) -> bool:
-        """Wysyła setpoint prędkości (NED). type_mask: ignoruj pozycję i przyspieszenie."""
+    def send_velocity_target_ned(
+        self,
+        time_boot_ms: int,
+        vx: float,
+        vy: float,
+        vz: float,
+        yaw: Optional[float] = None,
+    ) -> bool:
+        """Wysyła setpoint prędkości (NED). Opcjonalny yaw (rad, NED) — dron skierowany dziobem w kierunku lotu."""
         # Bits 0,1,2 = ignore x,y,z position; 6,7,8 = ignore ax,ay,az
         vel_only_mask = (1 << 0) | (1 << 1) | (1 << 2) | (1 << 6) | (1 << 7) | (1 << 8)
+        if yaw is None:
+            # ignoruj yaw — PX4 sam trzyma ostatni heading
+            vel_only_mask |= (1 << 10)
         return self.send_position_target_local_ned(
-            time_boot_ms, 0, 0, 0, vx, vy, vz, type_mask=vel_only_mask,
+            time_boot_ms, 0, 0, 0, vx, vy, vz,
+            yaw=float(yaw) if yaw is not None else 0.0,
+            type_mask=vel_only_mask,
         )
 
     def set_px4_parameters(self, params: dict[str, float], repeats: int = 3) -> bool:
@@ -290,41 +302,75 @@ class MavlinkOffboard:
         """
         Odczytuje pojedynczy parametr PX4 przez MAVLink PARAM_REQUEST_READ.
 
+        PX4 SITL offboard port (14580) wysyła odpowiedzi (PARAM_VALUE) na stały adres
+        zdefiniowany przez -o w px4-rc.mavlink (domyślnie 14540), nie z powrotem do nadawcy.
+        Dlatego nasłuchujemy na dodatkowym gnieździe udpin:0.0.0.0:14540.
+
         Zwraca float (param_value) lub None, jeśli timeout / brak odpowiedzi.
         """
         if self._conn is None:
             return None
 
         pid = str(param_id)[:16]
+
+        # Osobne gniazdo odbiorcze na 14540 — tam PX4 wysyła PARAM_VALUE (flaga -o w px4-rc.mavlink).
+        rx_conn = None
+        try:
+            rx_conn = mavutil.mavlink_connection(
+                "udpin:0.0.0.0:14540",
+                source_system=self._system_id,
+                source_component=self._component_id,
+            )
+        except Exception:
+            rx_conn = None
+
         try:
             self._conn.mav.param_request_read_send(
                 self._target_system,
                 self._target_component,
                 pid,
-                -1,  # param index: -1 = "latest"
+                -1,  # param index: -1 = szukaj po nazwie
             )
         except Exception:
+            if rx_conn is not None:
+                try:
+                    rx_conn.close()
+                except Exception:
+                    pass
             return None
 
-        t0 = time.time()
-        while time.time() - t0 < float(timeout_s):
+        def _match_param_value(conn) -> Optional[float]:
+            t0 = time.time()
+            while time.time() - t0 < float(timeout_s):
+                try:
+                    msg = conn.recv_match(type="PARAM_VALUE", blocking=True, timeout=0.1)
+                except Exception:
+                    msg = None
+                if msg is None:
+                    continue
+                try:
+                    got_id = getattr(msg, "param_id", None)
+                    if isinstance(got_id, bytes):
+                        got_id = got_id.decode("utf-8", errors="ignore")
+                    got_id = str(got_id).replace("\x00", "")
+                    if got_id[:16] == pid:
+                        return float(getattr(msg, "param_value", None))
+                except Exception:
+                    continue
+            return None
+
+        result = None
+        # Najpierw odbiornik 14540 (gdzie PX4 faktycznie wysyła odpowiedź).
+        if rx_conn is not None:
+            result = _match_param_value(rx_conn)
             try:
-                msg = self._conn.recv_match(type="PARAM_VALUE", blocking=True, timeout=0.1)
+                rx_conn.close()
             except Exception:
-                msg = None
-            if msg is None:
-                continue
-            try:
-                got_id = getattr(msg, "param_id", None)
-                # pymavlink bywa: bytes / str + padding null-ami
-                if isinstance(got_id, bytes):
-                    got_id = got_id.decode("utf-8", errors="ignore")
-                got_id = str(got_id).replace("\x00", "")
-                if got_id[:16] == pid:
-                    return float(getattr(msg, "param_value", None))
-            except Exception:
-                continue
-        return None
+                pass
+        # Fallback: spróbuj też na głównym gnieździe (np. gdy PX4 odpowiada do nadawcy).
+        if result is None:
+            result = _match_param_value(self._conn)
+        return result
 
     def read_px4_params(self, param_ids: list[str], timeout_s: float = 1.0) -> dict[str, float]:
         """
